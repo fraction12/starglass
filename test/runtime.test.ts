@@ -11,6 +11,7 @@ import {
   ObservationRuntime,
   defineEvent,
   eventIsNewerThanCursor,
+  createObservationPlan,
   selectObservationStrategy,
   stableEventId,
   type CheckpointRecord,
@@ -183,8 +184,8 @@ function makeHooks(log: string[]): RuntimeHooks<ExampleTarget> {
     onWatchStopped: ({ reason }) => {
       log.push(`watch-stop:${reason}`)
     },
-    onObservationPlanSelected: ({ strategy }) => {
-      log.push(`plan:${strategy.mode}`)
+    onObservationPlanSelected: ({ plan }) => {
+      log.push(`plan:${plan.strategy.mode}:${plan.change.kind}`)
     },
   }
 }
@@ -206,6 +207,39 @@ test('strategy selection prefers cheaper credible capabilities before snapshot d
   assert.equal(selectObservationStrategy({ cheapProbe: true }).mode, 'probe-then-fetch')
   assert.equal(selectObservationStrategy({ projectionDiff: true }).mode, 'projection-diff')
   assert.equal(selectObservationStrategy({}).mode, 'snapshot-diff')
+})
+
+test('observation plan reports initial fallback, upgrade, degradation, and resumed planning honestly', () => {
+  const initial = createObservationPlan({
+    adapterCapabilities: { projectionDiff: true },
+  })
+  const upgraded = createObservationPlan({
+    adapterCapabilities: { conditionalRequest: true, projectionDiff: true },
+    previousStrategy: initial.strategy,
+    resumedFromCheckpoint: true,
+  })
+  const degraded = createObservationPlan({
+    adapterCapabilities: { projectionDiff: true },
+    previousStrategy: upgraded.strategy,
+    resumedFromCheckpoint: true,
+  })
+  const resumedWithoutHistory = createObservationPlan({
+    adapterCapabilities: { cursor: true },
+    resumedFromCheckpoint: true,
+  })
+
+  assert.equal(initial.strategy.mode, 'projection-diff')
+  assert.equal(initial.change.kind, 'initial')
+  assert.match(initial.change.reason, /first observation plan/)
+  assert.equal(upgraded.strategy.mode, 'conditional')
+  assert.equal(upgraded.change.kind, 'upgraded')
+  assert.match(upgraded.change.reason, /upgraded from projection-diff to conditional/)
+  assert.equal(degraded.strategy.mode, 'projection-diff')
+  assert.equal(degraded.change.kind, 'degraded')
+  assert.match(degraded.change.reason, /degraded from conditional to projection-diff/)
+  assert.equal(resumedWithoutHistory.strategy.mode, 'cursor')
+  assert.equal(resumedWithoutHistory.change.kind, 'initial')
+  assert.match(resumedWithoutHistory.change.reason, /resumed without a prior recorded plan/)
 })
 
 test('custom source adapters can filter meaningful events and respect cursors', async () => {
@@ -323,6 +357,51 @@ test('file-backed checkpoint store rejects structurally invalid checkpoint state
           source: 'example.build',
           subject: 'example.build:acme/release',
           dispatchedEventIds: ['evt-1'],
+        },
+      })}\n`,
+      'utf8',
+    )
+
+    const store = new FileCheckpointStore(checkpointPath)
+
+    await assert.rejects(
+      () => store.read('target-a'),
+      (error: unknown) => {
+        assert.ok(error instanceof CorruptedCheckpointStateError)
+        assert.match((error as Error).message, /expected an object keyed by observation target id/)
+        return true
+      },
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('file-backed checkpoint store rejects invalid persisted observation plan change kinds', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
+  try {
+    const checkpointPath = path.join(dir, 'checkpoints.json')
+    await writeFile(
+      checkpointPath,
+      `${JSON.stringify({
+        'target-a': {
+          observationTargetId: 'target-a',
+          source: 'example.build',
+          subject: 'example.build:acme/release',
+          observation: {
+            strategy: { mode: 'cursor', reason: 'cursor available' },
+            plan: {
+              strategy: { mode: 'cursor', reason: 'cursor available' },
+              capabilities: { cursor: true },
+              change: { kind: 'sideways', reason: 'nonsense' },
+              inputs: {
+                target: {},
+                adapter: { cursor: true },
+                resumedFromCheckpoint: true,
+              },
+            },
+          },
+          dispatchedEventIds: [],
         },
       })}\n`,
       'utf8',
@@ -478,7 +557,7 @@ test('watch loop repeats polling and stops cleanly', async () => {
     assert.equal(dispatch.envelopes.length, 2)
     assert.ok(log.includes('watch-start:target-a:5'))
     assert.ok(log.includes('watch-stop:stopped'))
-    assert.ok(log.includes('plan:cursor'))
+    assert.ok(log.includes('plan:cursor:initial'))
     assert.ok(log.some((entry) => entry.startsWith('watch-cadence:activity:')))
   } finally {
     await rm(dir, { recursive: true, force: true })
@@ -587,7 +666,7 @@ test('runtime emits suppression, dispatch failure, checkpoint hooks, and plan ho
     assert.ok(log.some((entry) => entry === 'checkpoint:suppressed:1'))
     assert.ok(log.some((entry) => entry.startsWith('dispatch-failed:')))
     assert.ok(log.some((entry) => entry.startsWith('poll-complete:target-a:1:0')))
-    assert.ok(log.some((entry) => entry === 'plan:cursor'))
+    assert.ok(log.some((entry) => entry === 'plan:cursor:initial'))
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -641,7 +720,12 @@ test('http observation reports projection-diff before validators are learned, th
   })
 
   assert.equal(first.observation?.strategy?.mode, 'projection-diff')
+  assert.equal(first.observation?.plan?.strategy.mode, 'projection-diff')
+  assert.equal(first.observation?.plan?.change.kind, 'initial')
   assert.equal(second.observation?.strategy?.mode, 'conditional')
+  assert.equal(second.observation?.plan?.strategy.mode, 'conditional')
+  assert.equal(second.observation?.plan?.previousStrategy?.mode, 'projection-diff')
+  assert.equal(second.observation?.plan?.change.kind, 'upgraded')
 })
 
 test('http observation uses validators, persists compact fingerprint state, and suppresses unchanged 304 cycles', async () => {
@@ -715,6 +799,8 @@ test('http observation uses validators, persists compact fingerprint state, and 
     assert.equal(stored?.observation?.http?.lastModified, 'Wed, 16 Apr 2026 18:00:00 GMT')
     assert.ok(typeof stored?.observation?.fingerprint === 'string')
     assert.equal(stored?.observation?.strategy?.mode, 'conditional')
+    assert.equal(stored?.observation?.plan?.strategy.mode, 'conditional')
+    assert.equal(stored?.observation?.plan?.change.kind, 'upgraded')
     assert.equal(seenHeaders[1]?.['if-none-match'], '"v1"')
     assert.equal(seenHeaders[1]?.['if-modified-since'], 'Wed, 16 Apr 2026 18:00:00 GMT')
     const persistedRaw = await readFile(checkpointPath, 'utf8')
@@ -928,6 +1014,65 @@ test('watch loop honors persisted http hints within caller bounds', async () => 
     await controller.stop()
 
     assert.ok(log.some((entry) => entry.startsWith('watch-cadence:retry-after:15:changed')))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runtime replans degraded strategy when resumable capability disappears after restart', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
+  try {
+    const checkpointPath = path.join(dir, 'checkpoints.json')
+    const checkpointStore = new FileCheckpointStore(checkpointPath)
+    await checkpointStore.write({
+      observationTargetId: 'target-a',
+      source: 'example.build',
+      subject: 'example.build:acme/release',
+      observation: {
+        strategy: { mode: 'conditional', reason: 'conditional requests available' },
+        plan: {
+          strategy: { mode: 'conditional', reason: 'conditional requests available' },
+          capabilities: { conditionalRequest: true, projectionDiff: true },
+          change: {
+            kind: 'initial',
+            reason: 'seeded state',
+          },
+          inputs: {
+            target: {},
+            adapter: { conditionalRequest: true, projectionDiff: true },
+            resumedFromCheckpoint: true,
+          },
+        },
+      },
+      dispatchedEventIds: [],
+    })
+
+    const log: string[] = []
+    const runtime = new ObservationRuntime({
+      sourceAdapter: {
+        source: 'example.build',
+        capabilities() {
+          return { projectionDiff: true }
+        },
+        async poll() {
+          return {
+            events: [],
+            polledAt: '2026-04-16T02:00:00.000Z',
+          }
+        },
+      },
+      checkpointStore,
+      dispatchAdapters: [new RecordingDispatchAdapter()],
+      hooks: makeHooks(log),
+    })
+
+    await runtime.poll(makeTarget())
+    const stored = await checkpointStore.read('target-a')
+
+    assert.ok(log.includes('plan:projection-diff:degraded'))
+    assert.equal(stored?.observation?.plan?.previousStrategy?.mode, 'conditional')
+    assert.equal(stored?.observation?.plan?.strategy.mode, 'projection-diff')
+    assert.equal(stored?.observation?.plan?.change.kind, 'degraded')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

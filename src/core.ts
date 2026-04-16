@@ -69,6 +69,25 @@ export interface ObservationStrategy {
   reason: string
 }
 
+export type ObservationPlanChangeKind = 'initial' | 'unchanged' | 'upgraded' | 'degraded'
+
+export interface ObservationPlanInputs {
+  target: ObservationCapabilities
+  adapter: ObservationCapabilities
+  resumedFromCheckpoint: boolean
+}
+
+export interface ObservationPlan {
+  strategy: ObservationStrategy
+  capabilities: ObservationCapabilities
+  previousStrategy?: ObservationStrategy | undefined
+  change: {
+    kind: ObservationPlanChangeKind
+    reason: string
+  }
+  inputs: ObservationPlanInputs
+}
+
 export interface HttpValidators {
   etag?: string | undefined
   lastModified?: string | undefined
@@ -87,6 +106,7 @@ export interface ObservationCadenceState {
 
 export interface ObservationCheckpointState {
   strategy?: ObservationStrategy | undefined
+  plan?: ObservationPlan | undefined
   fingerprint?: string | undefined
   http?: HttpValidators | undefined
   cadence?: ObservationCadenceState | undefined
@@ -239,8 +259,7 @@ export interface WatchCadenceHookPayload<TTarget extends ObservationTarget = Obs
 
 export interface ObservationPlanSelectedHookPayload<TTarget extends ObservationTarget = ObservationTarget> {
   target: TTarget
-  strategy: ObservationStrategy
-  capabilities: ObservationCapabilities
+  plan: ObservationPlan
 }
 
 export interface RuntimeHooks<TTarget extends ObservationTarget = ObservationTarget> {
@@ -375,8 +394,58 @@ function isObservationCheckpointState(value: unknown): value is ObservationCheck
   return (
     (state.fingerprint === undefined || typeof state.fingerprint === 'string') &&
     (state.strategy === undefined || isObservationStrategy(state.strategy)) &&
+    (state.plan === undefined || isObservationPlan(state.plan)) &&
     (state.http === undefined || isHttpValidators(state.http)) &&
     (state.metadata === undefined || isStringRecord(state.metadata))
+  )
+}
+
+function isObservationPlan(value: unknown): value is ObservationPlan {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false
+  }
+
+  const plan = value as Partial<ObservationPlan>
+  return (
+    isObservationStrategy(plan.strategy) &&
+    isObservationCapabilities(plan.capabilities) &&
+    (plan.previousStrategy === undefined || isObservationStrategy(plan.previousStrategy)) &&
+    isObservationPlanChange(plan.change) &&
+    isObservationPlanInputs(plan.inputs)
+  )
+}
+
+function isObservationCapabilities(value: unknown): value is ObservationCapabilities {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false
+  }
+
+  return Object.values(value as Record<string, unknown>).every((entry) => typeof entry === 'boolean')
+}
+
+function isObservationPlanChange(value: unknown): value is ObservationPlan['change'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false
+  }
+
+  const change = value as Partial<ObservationPlan['change']>
+  return isObservationPlanChangeKind(change.kind) && typeof change.reason === 'string'
+}
+
+function isObservationPlanChangeKind(value: unknown): value is ObservationPlanChangeKind {
+  return value === 'initial' || value === 'unchanged' || value === 'upgraded' || value === 'degraded'
+}
+
+function isObservationPlanInputs(value: unknown): value is ObservationPlanInputs {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false
+  }
+
+  const inputs = value as Partial<ObservationPlanInputs>
+  return (
+    isObservationCapabilities(inputs.target) &&
+    isObservationCapabilities(inputs.adapter) &&
+    typeof inputs.resumedFromCheckpoint === 'boolean'
   )
 }
 
@@ -632,13 +701,14 @@ export class ObservationRuntime<TTarget extends ObservationTarget = ObservationT
     await emitHook(this.options.hooks?.onPollStarted, { target })
 
     const checkpoint = await this.options.checkpointStore.read(target.id)
-    const capabilities = mergeObservationCapabilities(target.observationCapabilities, this.options.sourceAdapter.capabilities?.(target, checkpoint))
-    const strategy = selectObservationStrategy(capabilities)
+    const targetCapabilities = target.observationCapabilities ?? {}
+    const adapterCapabilities = this.options.sourceAdapter.capabilities?.(target, checkpoint) ?? {}
+    const plan = resolveObservationPlan(targetCapabilities, adapterCapabilities, checkpoint)
+    const strategy = plan.strategy
 
     await emitHook(this.options.hooks?.onObservationPlanSelected, {
       target,
-      strategy,
-      capabilities,
+      plan,
     })
 
     const result = await this.options.sourceAdapter.poll(target, checkpoint)
@@ -654,6 +724,7 @@ export class ObservationRuntime<TTarget extends ObservationTarget = ObservationT
       lastSuccessfulPollAt: checkpoint?.lastSuccessfulPollAt,
       observation: mergeObservationState(checkpoint?.observation, {
         strategy,
+        plan,
         cadence: {
           ...(checkpoint?.observation?.cadence?.lastObservedChangeAt !== undefined
             ? { lastObservedChangeAt: checkpoint.observation.cadence.lastObservedChangeAt }
@@ -676,7 +747,7 @@ export class ObservationRuntime<TTarget extends ObservationTarget = ObservationT
           ...latestRecord,
           providerCursor: result.providerCursor ?? latestRecord.providerCursor,
           lastSuccessfulPollAt: result.polledAt,
-          observation: mergeObservationState(latestRecord.observation, result.observation, { strategy }),
+          observation: mergeObservationState(latestRecord.observation, result.observation, { strategy, plan }),
         })
         await this.options.checkpointStore.write(latestRecord)
         await emitHook(this.options.hooks?.onCheckpointAdvanced, {
@@ -727,6 +798,7 @@ export class ObservationRuntime<TTarget extends ObservationTarget = ObservationT
         lastSuccessfulPollAt: result.polledAt,
         observation: mergeObservationState(latestRecord.observation, result.observation, {
           strategy,
+          plan,
           cadence: {
             idleStreak: 0,
             lastObservedChangeAt: result.polledAt,
@@ -747,7 +819,7 @@ export class ObservationRuntime<TTarget extends ObservationTarget = ObservationT
         ...latestRecord,
         providerCursor: result.providerCursor ?? latestRecord.providerCursor,
         lastSuccessfulPollAt: result.polledAt,
-        observation: mergeObservationState(latestRecord.observation, result.observation, { strategy }),
+        observation: mergeObservationState(latestRecord.observation, result.observation, { strategy, plan }),
       })
       await this.options.checkpointStore.write(latestRecord)
       await emitHook(this.options.hooks?.onCheckpointAdvanced, {
@@ -784,6 +856,7 @@ export class ObservationRuntime<TTarget extends ObservationTarget = ObservationT
     const priorObservation = latestCheckpoint.observation
     const nextObservation: ObservationCheckpointState | undefined = {
       ...(priorObservation?.strategy !== undefined ? { strategy: priorObservation.strategy } : {}),
+      ...(priorObservation?.plan !== undefined ? { plan: priorObservation.plan } : {}),
       ...(priorObservation?.fingerprint !== undefined ? { fingerprint: priorObservation.fingerprint } : {}),
       ...(persistedHttp !== undefined ? { http: persistedHttp } : {}),
       ...(priorObservation?.metadata !== undefined ? { metadata: priorObservation.metadata } : {}),
@@ -869,7 +942,8 @@ export class HttpObservationAdapter implements SourceAdapter<HttpObservationTarg
     })
 
     const polledAt = this.now()
-    const strategy = selectObservationStrategy(this.capabilities(target, checkpoint))
+    const plan = resolveObservationPlan(target.observationCapabilities, this.capabilities(target, checkpoint), checkpoint)
+    const strategy = plan.strategy
     const validators = pickHttpValidators(response.headers, checkpoint?.observation?.http, polledAt)
 
     if (response.status === 304) {
@@ -878,6 +952,7 @@ export class HttpObservationAdapter implements SourceAdapter<HttpObservationTarg
         polledAt,
         observation: {
           strategy,
+          plan,
           http: validators,
           fingerprint: checkpoint?.observation?.fingerprint,
         },
@@ -901,6 +976,7 @@ export class HttpObservationAdapter implements SourceAdapter<HttpObservationTarg
         polledAt,
         observation: {
           strategy,
+          plan,
           http: validators,
           fingerprint,
         },
@@ -931,6 +1007,7 @@ export class HttpObservationAdapter implements SourceAdapter<HttpObservationTarg
       polledAt,
       observation: {
         strategy,
+        plan,
         http: validators,
         fingerprint,
       },
@@ -1059,6 +1136,9 @@ export function mergeObservationState(...states: Array<ObservationCheckpointStat
     if (state.strategy) {
       merged.strategy = state.strategy
     }
+    if (state.plan) {
+      merged.plan = state.plan
+    }
     if (state.fingerprint !== undefined) {
       merged.fingerprint = state.fingerprint
     }
@@ -1083,6 +1163,92 @@ export function mergeObservationState(...states: Array<ObservationCheckpointStat
   }
 
   return Object.keys(merged).length === 0 ? undefined : merged
+}
+
+export function createObservationPlan(input: {
+  targetCapabilities?: ObservationCapabilities
+  adapterCapabilities?: ObservationCapabilities
+  previousStrategy?: ObservationStrategy | undefined
+  resumedFromCheckpoint?: boolean | undefined
+}): ObservationPlan {
+  const targetCapabilities = input.targetCapabilities ?? {}
+  const adapterCapabilities = input.adapterCapabilities ?? {}
+  const capabilities = mergeObservationCapabilities(targetCapabilities, adapterCapabilities)
+  const strategy = selectObservationStrategy(capabilities)
+  const previousStrategy = input.previousStrategy
+
+  let change: ObservationPlan['change']
+  if (!previousStrategy) {
+    change = {
+      kind: 'initial',
+      reason: input.resumedFromCheckpoint
+        ? 'resumed without a prior recorded plan, selecting the current best strategy'
+        : 'first observation plan selected before any resumable state is learned',
+    }
+  } else if (previousStrategy.mode === strategy.mode) {
+    change = {
+      kind: 'unchanged',
+      reason: 'strategy remains the same after re-evaluating current capabilities and state',
+    }
+  } else if (compareObservationStrategyPriority(strategy.mode, previousStrategy.mode) < 0) {
+    change = {
+      kind: 'upgraded',
+      reason: `strategy upgraded from ${previousStrategy.mode} to ${strategy.mode} after better resumable capabilities became available`,
+    }
+  } else {
+    change = {
+      kind: 'degraded',
+      reason: `strategy degraded from ${previousStrategy.mode} to ${strategy.mode} because stronger capabilities are no longer available`,
+    }
+  }
+
+  return {
+    strategy,
+    capabilities,
+    ...(previousStrategy !== undefined ? { previousStrategy } : {}),
+    change,
+    inputs: {
+      target: targetCapabilities,
+      adapter: adapterCapabilities,
+      resumedFromCheckpoint: input.resumedFromCheckpoint ?? false,
+    },
+  }
+}
+
+function resolveObservationPlan(
+  targetCapabilities: ObservationCapabilities | undefined,
+  adapterCapabilities: ObservationCapabilities | undefined,
+  checkpoint: CheckpointRecord | undefined,
+): ObservationPlan {
+  return createObservationPlan({
+    ...(targetCapabilities !== undefined ? { targetCapabilities } : {}),
+    ...(adapterCapabilities !== undefined ? { adapterCapabilities } : {}),
+    ...(checkpoint?.observation?.plan?.strategy !== undefined || checkpoint?.observation?.strategy !== undefined
+      ? { previousStrategy: checkpoint?.observation?.plan?.strategy ?? checkpoint?.observation?.strategy }
+      : {}),
+    resumedFromCheckpoint: checkpoint !== undefined,
+  })
+}
+
+function compareObservationStrategyPriority(left: ObservationStrategyMode, right: ObservationStrategyMode): number {
+  return observationStrategyPriority(left) - observationStrategyPriority(right)
+}
+
+function observationStrategyPriority(mode: ObservationStrategyMode): number {
+  switch (mode) {
+    case 'push':
+      return 0
+    case 'conditional':
+      return 1
+    case 'cursor':
+      return 2
+    case 'probe-then-fetch':
+      return 3
+    case 'projection-diff':
+      return 4
+    case 'snapshot-diff':
+      return 5
+  }
 }
 
 interface AdaptiveCadencePlanInput {

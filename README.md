@@ -21,7 +21,7 @@ Starglass owns:
 - poll-cycle execution
 - normalized event contracts
 - compact checkpointing and dedupe
-- observation strategy selection
+- explicit observation planning and strategy selection
 - generic HTTP observation primitives
 - dispatch primitives
 
@@ -94,7 +94,7 @@ The command target receives a normalized JSON envelope on stdin.
 
 ## Strategy-aware observation
 
-Starglass can now resolve a minimal observation strategy from declared capabilities.
+Starglass can now resolve an explicit observation plan from declared capabilities.
 
 Priority order:
 1. push
@@ -104,7 +104,9 @@ Priority order:
 5. projection diff
 6. snapshot diff fallback
 
-Adapters can expose capabilities with `capabilities()`, and targets can add `observationCapabilities` hints. For generic HTTP, Starglass starts honestly in projection-diff mode until it learns validators from a prior response, then upgrades to conditional mode on later polls. The runtime records the chosen strategy in compact checkpoint state and emits `onObservationPlanSelected` hooks.
+Adapters can expose capabilities with `capabilities()`, and targets can add `observationCapabilities` hints. The runtime resolves a compact `ObservationPlan` before execution, including the selected strategy, the merged planning inputs, the previous strategy when one existed, and whether the plan is initial, unchanged, upgraded, or degraded.
+
+For generic HTTP, Starglass starts honestly in projection-diff mode until it learns validators from a prior response, then upgrades to conditional mode on later polls. If stronger resumable state disappears after restart or replanning, the runtime records that degradation explicitly instead of pretending the stronger mode is still active. The checkpoint stays compact, but callers can inspect the current plan through hooks or persisted observation metadata.
 
 ## Generic HTTP observation
 
@@ -273,6 +275,8 @@ await controller.stop()
 
 Starglass now plans the next attempt inside the watch loop itself. It uses compact observation metadata like `Retry-After`, `Cache-Control: max-age`, recent activity, and idle streaks, but always clamps the result to caller-supplied cadence bounds.
 
+That execution cadence is separate from observation-plan selection. Plan selection decides how a target will be observed. The watch loop then executes that plan and schedules the next attempt.
+
 You can also attach structured hooks without coupling Starglass to a logger or metrics backend:
 
 ```ts
@@ -282,7 +286,9 @@ const runtime = new ObservationRuntime({
   dispatchAdapters,
   hooks: {
     onPollStarted: ({ target }) => console.log('poll started', target.id),
-    onObservationPlanSelected: ({ strategy }) => console.log('strategy', strategy.mode, strategy.reason),
+    onObservationPlanSelected: ({ plan }) => {
+      console.log('strategy', plan.strategy.mode, plan.strategy.reason, plan.change.kind)
+    },
     onDispatchSucceeded: ({ event }) => console.log('dispatch ok', event.id),
     onDispatchFailed: ({ event, error }) => console.error('dispatch failed', event.id, error),
     onCheckpointAdvanced: ({ reason, record }) => console.log('checkpoint', reason, record.observationTargetId),
