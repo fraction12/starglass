@@ -1,0 +1,55 @@
+{
+  "name": "starglass",
+  "version": "0.1.0",
+  "description": "Observation and dispatch layer for agent systems.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/**/*.test.ts",
+    "prepack": "npm run build",
+    "verify:packaging": "node ./scripts/verify-packaging.mjs",
+    "release:check": "npm run check && npm test && npm run build && npm pack --json && npm run verify:packaging",
+    "dev": "node --import tsx src/index.ts"
+  },
+  "keywords": [
+    "agents",
+    "events",
+    "observers",
+    "automation",
+    "watchers",
+    "adapters"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fraction12/starglass.git"
+  },
+  "homepage": "https://github.com/fraction12/starglass#readme",
+  "bugs": {
+    "url": "https://github.com/fraction12/starglass/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.8.3"
+  }
+}
+
