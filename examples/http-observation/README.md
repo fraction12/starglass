@@ -15,6 +15,8 @@ import {
   FileCheckpointStore,
   HttpObservationAdapter,
   ObservationRuntime,
+  html,
+  projectJson,
 } from 'starglass'
 
 const runtime = new ObservationRuntime({
@@ -38,22 +40,37 @@ await runtime.poll({
   subject: 'http:https://status.example.com/api/summary',
   url: 'https://status.example.com/api/summary',
   format: 'json',
-  project: (document) => {
-    const payload = document as {
-      status: { indicator: string; description: string }
-      page: { updated_at: string }
-    }
-
-    return {
-      indicator: payload.status.indicator,
-      description: payload.status.description,
-      updatedAt: payload.page.updated_at,
-    }
-  },
+  project: projectJson.shape({
+    indicator: projectJson.path('status', 'indicator'),
+    description: projectJson.path('status', 'description'),
+    updatedAt: projectJson.path('page', 'updated_at'),
+  }),
+  // projectJson.pick() and projectJson.path() are small helpers for common cases.
   dispatch: {
     kind: 'handler',
     handler: async (envelope) => {
       console.log('observed projection', envelope.event.payload.projection)
+    },
+  },
+})
+```
+
+For HTML, keep the contract equally small:
+
+```ts
+await runtime.poll({
+  id: 'http:html:headline',
+  source: 'http',
+  subject: 'http:https://status.example.com/',
+  url: 'https://status.example.com/',
+  format: 'html',
+  extract: html.extract((document) => ({
+    headline: document.match(/<h1>(.*?)<\/h1>/)?.[1] ?? null,
+  })),
+  dispatch: {
+    kind: 'handler',
+    handler: async (envelope) => {
+      console.log('headline', envelope.event.payload.projection)
     },
   },
 })

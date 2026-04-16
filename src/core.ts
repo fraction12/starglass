@@ -888,14 +888,27 @@ export interface HttpTargetBase extends ObservationTarget {
   headers?: Record<string, string>
 }
 
+export type JsonProjection = (document: unknown) => unknown
+export type HtmlExtractionProjector = (document: string) => unknown
+
+const HTML_EXTRACTION_SENTINEL = '__starglassHtmlExtraction'
+
+export interface HtmlExtraction {
+  projection: unknown
+  [HTML_EXTRACTION_SENTINEL]: true
+}
+
+export type HtmlExtractionResult = unknown | HtmlExtraction
+export type HtmlProjection = (document: string) => HtmlExtractionResult
+
 export interface JsonHttpObservationTarget extends HttpTargetBase {
   format: 'json'
-  project: (document: unknown) => unknown
+  project: JsonProjection
 }
 
 export interface HtmlHttpObservationTarget extends HttpTargetBase {
   format: 'html'
-  extract: (document: string) => unknown
+  extract: HtmlProjection
 }
 
 export type HttpObservationTarget = JsonHttpObservationTarget | HtmlHttpObservationTarget
@@ -903,6 +916,39 @@ export type HttpObservationTarget = JsonHttpObservationTarget | HtmlHttpObservat
 export interface HttpObservationOptions {
   fetch?: typeof fetch
   now?: () => string
+}
+
+export const projectJson = {
+  pick: <TDocument extends Record<string, unknown>, const TKeys extends readonly (keyof TDocument)[]>(...keys: TKeys) =>
+    (document: unknown): Pick<TDocument, TKeys[number]> => {
+      const record = asRecord(document)
+      return keys.reduce((projection, key) => {
+        projection[key] = record[key as string] as TDocument[TKeys[number]]
+        return projection
+      }, {} as Pick<TDocument, TKeys[number]>)
+    },
+  path: (...pathSegments: readonly (string | number)[]) =>
+    (document: unknown): unknown => getPath(document, pathSegments),
+  shape: <TShape extends Record<string, JsonProjection>>(shape: TShape) =>
+    (document: unknown): { [TKey in keyof TShape]: ReturnType<TShape[TKey]> } => {
+      return Object.keys(shape).reduce((projection, key) => {
+        const projector = shape[key] as JsonProjection
+        ;(projection as Record<string, unknown>)[key] = projector(document)
+        return projection
+      }, {} as { [TKey in keyof TShape]: ReturnType<TShape[TKey]> })
+    },
+}
+
+export const normalize = Object.freeze({
+  projection: normalizeProjection,
+  stable: normalizeProjection,
+})
+
+export const html = {
+  extract: (project: HtmlExtractionProjector) => (document: string): HtmlExtraction => ({
+    projection: project(document),
+    [HTML_EXTRACTION_SENTINEL]: true,
+  }),
 }
 
 export class HttpObservationAdapter implements SourceAdapter<HttpObservationTarget> {
@@ -966,7 +1012,7 @@ export class HttpObservationAdapter implements SourceAdapter<HttpObservationTarg
     const rawBody = await response.text()
     const projection = target.format === 'json'
       ? normalizeProjection(target.project(JSON.parse(rawBody)))
-      : normalizeProjection(target.extract(rawBody))
+      : normalizeProjection(resolveHtmlExtraction(target.extract(rawBody)).projection)
     const fingerprint = stableFingerprint(projection)
     const previousFingerprint = checkpoint?.observation?.fingerprint
 
@@ -1075,6 +1121,43 @@ function hasPersistedValidators(validators?: HttpValidators): boolean {
   return Boolean(validators?.etag || validators?.lastModified)
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('Expected a JSON object projection source')
+  }
+
+  return value as Record<string, unknown>
+}
+
+function getPath(value: unknown, pathSegments: readonly (string | number)[]): unknown {
+  return pathSegments.reduce((current, segment) => {
+    if (typeof segment === 'number') {
+      return Array.isArray(current) ? current[segment] : undefined
+    }
+    return current && typeof current === 'object' ? (current as Record<string, unknown>)[segment] : undefined
+  }, value)
+}
+
+function resolveHtmlExtraction(result: HtmlExtractionResult): HtmlExtraction {
+  if (isHtmlExtraction(result)) {
+    return result
+  }
+
+  return {
+    projection: result,
+    [HTML_EXTRACTION_SENTINEL]: true,
+  }
+}
+
+function isHtmlExtraction(value: unknown): value is HtmlExtraction {
+  return Boolean(
+    value
+      && typeof value === 'object'
+      && !Array.isArray(value)
+      && (value as Record<string, unknown>)[HTML_EXTRACTION_SENTINEL] === true,
+  )
+}
+
 function normalizeProjection(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map((entry) => normalizeProjection(entry))
@@ -1084,16 +1167,31 @@ function normalizeProjection(value: unknown): unknown {
     return Object.keys(value as Record<string, unknown>)
       .sort((left, right) => left.localeCompare(right))
       .reduce<Record<string, unknown>>((accumulator, key) => {
-        accumulator[key] = normalizeProjection((value as Record<string, unknown>)[key])
+        const normalizedValue = normalizeProjection((value as Record<string, unknown>)[key])
+        if (normalizedValue !== undefined) {
+          accumulator[key] = normalizedValue
+        }
         return accumulator
       }, {})
+  }
+
+  if (typeof value === 'number') {
+    if (Number.isNaN(value)) {
+      return 'NaN'
+    }
+    if (!Number.isFinite(value)) {
+      return value > 0 ? 'Infinity' : '-Infinity'
+    }
+    if (Object.is(value, -0)) {
+      return 0
+    }
   }
 
   return value
 }
 
 function stableFingerprint(value: unknown): string {
-  return createHash('sha256').update(JSON.stringify(value)).digest('hex')
+  return createHash('sha256').update(JSON.stringify(normalizeProjection(value))).digest('hex')
 }
 
 export function mergeObservationCapabilities(

@@ -173,6 +173,29 @@ await runtime.poll({
 
 For HTML targets, replace `format: 'json'` and `project()` with `format: 'html'` and `extract()`.
 
+You can keep projection authoring small and generic with the built-in helpers:
+
+```ts
+import { html, normalize, projectJson } from 'starglass'
+
+const projectStatus = projectJson.shape({
+  indicator: projectJson.path('status', 'indicator'),
+  description: projectJson.path('status', 'description'),
+  updatedAt: projectJson.path('page', 'updated_at'),
+})
+
+const stableProjection = normalize.stable({
+  noisyField: undefined,
+  meaningful: projectStatus(document),
+})
+
+const extractHeadline = html.extract((document) => ({
+  headline: document.match(/<h1>(.*?)<\/h1>/)?.[1] ?? null,
+}))
+```
+
+These helpers stay intentionally narrow: Starglass helps define a stable observed projection, but your business policy still decides what that projection means downstream.
+
 See `examples/http-observation/README.md` for a focused example.
 
 ## Adapter authoring guidance

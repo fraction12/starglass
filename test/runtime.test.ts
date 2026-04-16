@@ -12,6 +12,9 @@ import {
   defineEvent,
   eventIsNewerThanCursor,
   createObservationPlan,
+  html,
+  normalize,
+  projectJson,
   selectObservationStrategy,
   stableEventId,
   type CheckpointRecord,
@@ -847,6 +850,43 @@ test('http observation ignores irrelevant JSON churn via normalized projection d
   assert.equal(second.events.length, 0)
 })
 
+test('json projection helpers compose meaningful fields deterministically', async () => {
+  const project = projectJson.shape({
+    title: projectJson.path('status', 'title'),
+    state: projectJson.path('status', 'state'),
+    summary: (document) => projectJson.pick<{ summary: string }, ['summary']>('summary')(document).summary,
+  })
+
+  assert.deepEqual(
+    project({
+      summary: 'All systems nominal',
+      status: { state: 'green', title: 'Healthy' },
+      noisy: true,
+    }),
+    {
+      title: 'Healthy',
+      state: 'green',
+      summary: 'All systems nominal',
+    },
+  )
+})
+
+test('normalization collapses equivalent values for hashing and diffing', async () => {
+  const left = normalize.stable({
+    b: 2,
+    a: 1,
+    skip: undefined,
+    nested: { z: -0, x: Number.NaN, y: Number.POSITIVE_INFINITY },
+  })
+  const right = normalize.stable({
+    a: 1,
+    nested: { y: Number.POSITIVE_INFINITY, x: Number.NaN, z: 0 },
+    b: 2,
+  })
+
+  assert.deepEqual(left, right)
+})
+
 test('http observation supports html extraction diffing without storing raw html', async () => {
   const adapter = new HttpObservationAdapter({
     now: () => '2026-04-16T18:05:00.000Z',
@@ -863,10 +903,10 @@ test('http observation supports html extraction diffing without storing raw html
     subject: 'http:https://example.test/page',
     url: 'https://example.test/page',
     format: 'html' as const,
-    extract: (document: string) => {
+    extract: html.extract((document: string) => {
       const match = document.match(/<h1>(.*?)<\/h1>/)
       return { headline: match?.[1] ?? null }
-    },
+    }),
     dispatch: { kind: 'handler' as const, handler: async () => {} },
   }
 
@@ -882,6 +922,60 @@ test('http observation supports html extraction diffing without storing raw html
   assert.equal(result.observation?.http?.etag, '"html-v1"')
 })
 
+
+test('html extraction contract accepts wrapped projection results', async () => {
+  const adapter = new HttpObservationAdapter({
+    now: () => '2026-04-16T18:05:00.000Z',
+    fetch: async () =>
+      new Response('<html><body><main><h1>Wrapped</h1></main></body></html>', {
+        status: 200,
+      }),
+  })
+
+  const target = {
+    id: 'http:html:wrapped',
+    source: 'http' as const,
+    subject: 'http:https://example.test/wrapped',
+    url: 'https://example.test/wrapped',
+    format: 'html' as const,
+    extract: html.extract(() => ({ headline: 'Wrapped' })),
+    dispatch: { kind: 'handler' as const, handler: async () => {} },
+  }
+
+  const result = await adapter.poll(target)
+  assert.deepEqual(result.events[0]?.payload, {
+    url: 'https://example.test/wrapped',
+    format: 'html',
+    projection: { headline: 'Wrapped' },
+  })
+})
+
+test('plain html projections may contain a projection field without being collapsed', async () => {
+  const adapter = new HttpObservationAdapter({
+    now: () => '2026-04-16T18:05:00.000Z',
+    fetch: async () =>
+      new Response('<html><body><main><h1>Wrapped</h1></main></body></html>', {
+        status: 200,
+      }),
+  })
+
+  const target = {
+    id: 'http:html:projection-field',
+    source: 'http' as const,
+    subject: 'http:https://example.test/projection-field',
+    url: 'https://example.test/projection-field',
+    format: 'html' as const,
+    extract: () => ({ projection: 'Wrapped', other: 1 }),
+    dispatch: { kind: 'handler' as const, handler: async () => {} },
+  }
+
+  const result = await adapter.poll(target)
+  assert.deepEqual(result.events[0]?.payload, {
+    url: 'https://example.test/projection-field',
+    format: 'html',
+    projection: { other: 1, projection: 'Wrapped' },
+  })
+})
 
 test('http observation persists retry and cache hints as compact next-poll metadata', async () => {
   const adapter = new HttpObservationAdapter({
