@@ -73,7 +73,7 @@ Checkpointing should evolve from a narrow dispatched-event ledger into a compact
 
 The state should be able to include, when relevant:
 - provider cursor
-n- HTTP validators such as `ETag` and `Last-Modified`
+- HTTP validators such as `ETag` and `Last-Modified`
 - last meaningful projection fingerprint
 - last successful strategy selection
 - last probe or fetch metadata

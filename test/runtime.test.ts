@@ -7,9 +7,11 @@ import {
   CommandDispatchAdapter,
   CorruptedCheckpointStateError,
   FileCheckpointStore,
+  HttpObservationAdapter,
   ObservationRuntime,
   defineEvent,
   eventIsNewerThanCursor,
+  selectObservationStrategy,
   stableEventId,
   type CheckpointRecord,
   type DispatchAdapter,
@@ -53,6 +55,13 @@ class ExampleSourceAdapter implements SourceAdapter<ExampleTarget> {
     private readonly providerCursor = '2026-04-16T01:00:00.000Z',
   ) {}
 
+  capabilities(_target: ObservationTarget, _checkpoint?: CheckpointRecord) {
+    return {
+      cursor: true,
+      projectionDiff: true,
+    }
+  }
+
   async poll(target: ExampleTarget, checkpoint?: CheckpointRecord) {
     const filtered = this.events
       .filter((event) => target.watch.includes(event.kind))
@@ -73,6 +82,12 @@ class SequencedSourceAdapter implements SourceAdapter<ExampleTarget> {
 
   constructor(private readonly batches: ObservationEvent[][]) {}
 
+  capabilities(_target: ObservationTarget, _checkpoint?: CheckpointRecord) {
+    return {
+      cursor: true,
+    }
+  }
+
   async poll(): Promise<{ events: ObservationEvent[]; polledAt: string; providerCursor: string }> {
     const events = this.batches[Math.min(this.index, this.batches.length - 1)] ?? []
     this.index += 1
@@ -89,6 +104,12 @@ class FailingThenPassingSourceAdapter implements SourceAdapter<ExampleTarget> {
   calls = 0
 
   constructor(private readonly failuresBeforeSuccess: number) {}
+
+  capabilities(_target: ObservationTarget, _checkpoint?: CheckpointRecord) {
+    return {
+      cursor: true,
+    }
+  }
 
   async poll(): Promise<{ events: ObservationEvent[]; polledAt: string; providerCursor: string }> {
     this.calls += 1
@@ -110,6 +131,7 @@ function makeTarget(input?: Partial<ExampleTarget>): ExampleTarget {
     source: 'example.build',
     subject: input?.subject ?? 'example.build:acme/release',
     watch: input?.watch ?? ['build.failed', 'build.succeeded'],
+    observationCapabilities: input?.observationCapabilities,
     dispatch: input?.dispatch ?? { kind: 'handler', handler: async () => {} },
   }
 }
@@ -155,8 +177,14 @@ function makeHooks(log: string[]): RuntimeHooks<ExampleTarget> {
     onWatchBackoff: ({ consecutiveFailures, delayMs }) => {
       log.push(`watch-backoff:${consecutiveFailures}:${delayMs}`)
     },
+    onWatchCadencePlanned: ({ reason, delayMs, changed, idleStreak, boundedBy }) => {
+      log.push(`watch-cadence:${reason}:${delayMs}:${changed ? 'changed' : 'same'}:${idleStreak}:${boundedBy}`)
+    },
     onWatchStopped: ({ reason }) => {
       log.push(`watch-stop:${reason}`)
+    },
+    onObservationPlanSelected: ({ strategy }) => {
+      log.push(`plan:${strategy.mode}`)
     },
   }
 }
@@ -169,6 +197,15 @@ test('stableEventId is deterministic and cursor checks are generic', () => {
   assert.equal(left, right)
   assert.equal(eventIsNewerThanCursor(event, '2026-04-16T00:03:00.000Z'), true)
   assert.equal(eventIsNewerThanCursor(event, '2026-04-16T00:05:00.000Z'), false)
+})
+
+test('strategy selection prefers cheaper credible capabilities before snapshot diff', () => {
+  assert.equal(selectObservationStrategy({ push: true, conditionalRequest: true }).mode, 'push')
+  assert.equal(selectObservationStrategy({ conditionalRequest: true, cursor: true }).mode, 'conditional')
+  assert.equal(selectObservationStrategy({ cursor: true, projectionDiff: true }).mode, 'cursor')
+  assert.equal(selectObservationStrategy({ cheapProbe: true }).mode, 'probe-then-fetch')
+  assert.equal(selectObservationStrategy({ projectionDiff: true }).mode, 'projection-diff')
+  assert.equal(selectObservationStrategy({}).mode, 'snapshot-diff')
 })
 
 test('custom source adapters can filter meaningful events and respect cursors', async () => {
@@ -322,6 +359,9 @@ test('file-backed checkpoint store keeps previous live state when replacement re
       source: 'example.build',
       subject: 'example.build:acme/release',
       providerCursor: 'cursor-1',
+      observation: {
+        fingerprint: 'abc',
+      },
       dispatchedEventIds: ['evt-1'],
     }
 
@@ -334,6 +374,9 @@ test('file-backed checkpoint store keeps previous live state when replacement re
         store.write({
           ...initialRecord,
           providerCursor: 'cursor-2',
+          observation: {
+            fingerprint: 'def',
+          },
           dispatchedEventIds: ['evt-1', 'evt-2'],
         }),
       /rename exploded/,
@@ -345,6 +388,7 @@ test('file-backed checkpoint store keeps previous live state when replacement re
     const persisted = await new FileCheckpointStore(checkpointPath).read('target-a')
     assert.equal(persisted?.providerCursor, 'cursor-1')
     assert.deepEqual(persisted?.dispatchedEventIds, ['evt-1'])
+    assert.equal(persisted?.observation?.fingerprint, 'abc')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -419,7 +463,13 @@ test('watch loop repeats polling and stops cleanly', async () => {
       hooks: makeHooks(log),
     })
 
-    const controller = runtime.watch(makeTarget(), { intervalMs: 5 })
+    const controller = runtime.watch(makeTarget(), {
+      intervalMs: 5,
+      cadence: {
+        minIntervalMs: 2,
+        maxIntervalMs: 20,
+      },
+    })
 
     await new Promise((resolve) => setTimeout(resolve, 30))
     await controller.stop()
@@ -428,6 +478,8 @@ test('watch loop repeats polling and stops cleanly', async () => {
     assert.equal(dispatch.envelopes.length, 2)
     assert.ok(log.includes('watch-start:target-a:5'))
     assert.ok(log.includes('watch-stop:stopped'))
+    assert.ok(log.includes('plan:cursor'))
+    assert.ok(log.some((entry) => entry.startsWith('watch-cadence:activity:')))
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -446,13 +498,22 @@ test('watch loop backs off after failure and recovers', async () => {
       hooks: makeHooks(log),
     })
 
-    const controller = runtime.watch(makeTarget(), { intervalMs: 5, backoffMs: 7, maxBackoffMs: 20 })
+    const controller = runtime.watch(makeTarget(), {
+      intervalMs: 5,
+      backoffMs: 7,
+      maxBackoffMs: 20,
+      cadence: {
+        minIntervalMs: 3,
+        maxIntervalMs: 20,
+      },
+    })
     await new Promise((resolve) => setTimeout(resolve, 35))
     await controller.stop()
 
     assert.ok(sourceAdapter.calls >= 2)
     assert.ok(log.includes('watch-failed:1:poll failed 1'))
     assert.ok(log.includes('watch-backoff:1:7'))
+    assert.ok(log.some((entry) => entry.startsWith('watch-cadence:failure-backoff:7:changed')))
     assert.ok(log.includes('watch-stop:stopped'))
   } finally {
     await rm(dir, { recursive: true, force: true })
@@ -477,18 +538,23 @@ test('watch loop fails terminally when max consecutive failures is reached', asy
       backoffMs: 5,
       maxBackoffMs: 10,
       maxConsecutiveFailures: 2,
+      cadence: {
+        minIntervalMs: 3,
+        maxIntervalMs: 10,
+      },
     })
 
     await assert.rejects(() => controller.stopped, /poll failed 2/)
     assert.ok(log.includes('watch-failed:1:poll failed 1'))
     assert.ok(log.includes('watch-failed:2:poll failed 2'))
+    assert.ok(log.some((entry) => entry.startsWith('watch-cadence:failure-backoff:5:changed')))
     assert.ok(log.includes('watch-stop:failed'))
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
 })
 
-test('runtime emits suppression, dispatch failure, and checkpoint hooks for one-shot poll', async () => {
+test('runtime emits suppression, dispatch failure, checkpoint hooks, and plan hooks for one-shot poll', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
   try {
     const checkpointPath = path.join(dir, 'checkpoints.json')
@@ -521,7 +587,438 @@ test('runtime emits suppression, dispatch failure, and checkpoint hooks for one-
     assert.ok(log.some((entry) => entry === 'checkpoint:suppressed:1'))
     assert.ok(log.some((entry) => entry.startsWith('dispatch-failed:')))
     assert.ok(log.some((entry) => entry.startsWith('poll-complete:target-a:1:0')))
+    assert.ok(log.some((entry) => entry === 'plan:cursor'))
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('http observation reports projection-diff before validators are learned, then upgrades to conditional', async () => {
+  const responses = [
+    new Response(JSON.stringify({ title: 'One' }), {
+      status: 200,
+      headers: {
+        etag: '"v1"',
+        'content-type': 'application/json',
+      },
+    }),
+    new Response(null, {
+      status: 304,
+      headers: {
+        etag: '"v1"',
+      },
+    }),
+  ]
+
+  const adapter = new HttpObservationAdapter({
+    now: () => '2026-04-16T18:05:00.000Z',
+    fetch: async () => {
+      const response = responses.shift()
+      if (!response) {
+        throw new Error('missing response')
+      }
+      return response
+    },
+  })
+
+  const target = {
+    id: 'http:json:news-strategy',
+    source: 'http' as const,
+    subject: 'http:https://example.test/news.json',
+    url: 'https://example.test/news.json',
+    format: 'json' as const,
+    project: (document: unknown) => ({ title: (document as { title: string }).title }),
+    dispatch: { kind: 'handler' as const, handler: async () => {} },
+  }
+
+  const first = await adapter.poll(target)
+  const second = await adapter.poll(target, {
+    observationTargetId: target.id,
+    source: target.source,
+    subject: target.subject,
+    observation: first.observation,
+    dispatchedEventIds: first.events.map((event) => event.id),
+  })
+
+  assert.equal(first.observation?.strategy?.mode, 'projection-diff')
+  assert.equal(second.observation?.strategy?.mode, 'conditional')
+})
+
+test('http observation uses validators, persists compact fingerprint state, and suppresses unchanged 304 cycles', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
+  try {
+    const checkpointPath = path.join(dir, 'checkpoints.json')
+    const responses = [
+      new Response(JSON.stringify({ title: 'One', noisy: 1 }), {
+        status: 200,
+        headers: {
+          etag: '"v1"',
+          'last-modified': 'Wed, 16 Apr 2026 18:00:00 GMT',
+          'content-type': 'application/json',
+        },
+      }),
+      new Response(null, {
+        status: 304,
+        headers: {
+          etag: '"v1"',
+        },
+      }),
+    ]
+
+    const seenHeaders: Array<Record<string, string>> = []
+    const adapter = new HttpObservationAdapter({
+      now: () => '2026-04-16T18:05:00.000Z',
+      fetch: async (_url, init) => {
+        const headers = new Headers(init?.headers)
+        seenHeaders.push(Object.fromEntries(headers.entries()))
+        const response = responses.shift()
+        if (!response) {
+          throw new Error('missing response')
+        }
+        return response
+      },
+    })
+
+    const dispatch = new RecordingDispatchAdapter()
+    const runtime = new ObservationRuntime({
+      sourceAdapter: adapter,
+      checkpointStore: new FileCheckpointStore(checkpointPath),
+      dispatchAdapters: [dispatch],
+    })
+
+    const target = {
+      id: 'http:json:news',
+      source: 'http' as const,
+      subject: 'http:https://example.test/news.json',
+      url: 'https://example.test/news.json',
+      format: 'json' as const,
+      project: (document: unknown) => {
+        const payload = document as { title: string; noisy: number }
+        return { title: payload.title }
+      },
+      dispatch: { kind: 'handler' as const, handler: async () => {} },
+    }
+
+    const first = await runtime.poll(target)
+    const second = await runtime.poll(target)
+    const stored = await new FileCheckpointStore(checkpointPath).read(target.id)
+
+    assert.equal(first.length, 1)
+    assert.equal(second.length, 0)
+    assert.equal(dispatch.envelopes.length, 1)
+    assert.deepEqual(first[0]?.payload, {
+      url: 'https://example.test/news.json',
+      format: 'json',
+      projection: { title: 'One' },
+    })
+    assert.equal(stored?.observation?.http?.etag, '"v1"')
+    assert.equal(stored?.observation?.http?.lastModified, 'Wed, 16 Apr 2026 18:00:00 GMT')
+    assert.ok(typeof stored?.observation?.fingerprint === 'string')
+    assert.equal(stored?.observation?.strategy?.mode, 'conditional')
+    assert.equal(seenHeaders[1]?.['if-none-match'], '"v1"')
+    assert.equal(seenHeaders[1]?.['if-modified-since'], 'Wed, 16 Apr 2026 18:00:00 GMT')
+    const persistedRaw = await readFile(checkpointPath, 'utf8')
+    assert.doesNotMatch(persistedRaw, /"title": "One"/)
+    assert.doesNotMatch(persistedRaw, /"noisy": 1/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('http observation ignores irrelevant JSON churn via normalized projection diff', async () => {
+  const adapter = new HttpObservationAdapter({
+    now: () => '2026-04-16T18:05:00.000Z',
+    fetch: async () =>
+      new Response(JSON.stringify({ b: 2, a: 1, noisy: Date.now() }), {
+        status: 200,
+        headers: { etag: '"same-shape"' },
+      }),
+  })
+
+  const target = {
+    id: 'http:json:stable',
+    source: 'http' as const,
+    subject: 'http:https://example.test/stable.json',
+    url: 'https://example.test/stable.json',
+    format: 'json' as const,
+    project: (document: unknown) => {
+      const payload = document as { a: number; b: number }
+      return { b: payload.b, a: payload.a }
+    },
+    dispatch: { kind: 'handler' as const, handler: async () => {} },
+  }
+
+  const first = await adapter.poll(target)
+  const second = await adapter.poll(target, {
+    observationTargetId: target.id,
+    source: target.source,
+    subject: target.subject,
+    observation: first.observation,
+    dispatchedEventIds: first.events.map((event) => event.id),
+  })
+
+  assert.equal(first.events.length, 1)
+  assert.equal(second.events.length, 0)
+})
+
+test('http observation supports html extraction diffing without storing raw html', async () => {
+  const adapter = new HttpObservationAdapter({
+    now: () => '2026-04-16T18:05:00.000Z',
+    fetch: async () =>
+      new Response('<html><body><h1>Headline</h1><div class="chrome">Layout</div></body></html>', {
+        status: 200,
+        headers: { etag: '"html-v1"' },
+      }),
+  })
+
+  const target = {
+    id: 'http:html:headline',
+    source: 'http' as const,
+    subject: 'http:https://example.test/page',
+    url: 'https://example.test/page',
+    format: 'html' as const,
+    extract: (document: string) => {
+      const match = document.match(/<h1>(.*?)<\/h1>/)
+      return { headline: match?.[1] ?? null }
+    },
+    dispatch: { kind: 'handler' as const, handler: async () => {} },
+  }
+
+  const result = await adapter.poll(target)
+
+  assert.equal(result.events.length, 1)
+  assert.deepEqual(result.events[0]?.payload, {
+    url: 'https://example.test/page',
+    format: 'html',
+    projection: { headline: 'Headline' },
+  })
+  assert.ok(result.observation?.fingerprint)
+  assert.equal(result.observation?.http?.etag, '"html-v1"')
+})
+
+
+test('http observation persists retry and cache hints as compact next-poll metadata', async () => {
+  const adapter = new HttpObservationAdapter({
+    now: () => '2026-04-16T18:05:00.000Z',
+    fetch: async () =>
+      new Response(JSON.stringify({ title: 'Hinted' }), {
+        status: 200,
+        headers: {
+          etag: '"v2"',
+          'retry-after': '120',
+          'cache-control': 'public, max-age=60',
+        },
+      }),
+  })
+
+  const target = {
+    id: 'http:json:hints',
+    source: 'http' as const,
+    subject: 'http:https://example.test/hints.json',
+    url: 'https://example.test/hints.json',
+    format: 'json' as const,
+    project: (document: unknown) => ({ title: (document as { title: string }).title }),
+    dispatch: { kind: 'handler' as const, handler: async () => {} },
+  }
+
+  const result = await adapter.poll(target)
+
+  assert.equal(result.observation?.http?.retryAfterAt, '2026-04-16T18:07:00.000Z')
+  assert.equal(result.observation?.http?.nextPollAfter, '2026-04-16T18:06:00.000Z')
+})
+
+test('watch loop slows down quiet targets within caller bounds and persists next attempt metadata', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
+  try {
+    const sourceAdapter = new SequencedSourceAdapter([[], [], []])
+    const runtime = new ObservationRuntime({
+      sourceAdapter,
+      checkpointStore: new FileCheckpointStore(path.join(dir, 'checkpoints.json')),
+      dispatchAdapters: [new RecordingDispatchAdapter()],
+    })
+
+    const controller = runtime.watch(makeTarget(), {
+      intervalMs: 5,
+      cadence: {
+        minIntervalMs: 5,
+        maxIntervalMs: 20,
+        idleMultiplier: 2,
+      },
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    await controller.stop()
+
+    const stored = await new FileCheckpointStore(path.join(dir, 'checkpoints.json')).read('target-a')
+    assert.equal(stored?.observation?.cadence?.idleStreak, 3)
+    assert.equal(stored?.observation?.cadence?.currentDelayMs, 20)
+    assert.equal(stored?.observation?.cadence?.lastReason, 'idle')
+    assert.ok(stored?.observation?.cadence?.nextAttemptAt)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('watch loop preserves lastObservedChangeAt across later cadence updates', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
+  try {
+    const checkpointPath = path.join(dir, 'checkpoints.json')
+    const sourceAdapter = new SequencedSourceAdapter([[makeEvent({ id: stableEventId('build.failed', 'cadence-change') })], [], []])
+    const runtime = new ObservationRuntime({
+      sourceAdapter,
+      checkpointStore: new FileCheckpointStore(checkpointPath),
+      dispatchAdapters: [new RecordingDispatchAdapter()],
+    })
+
+    const controller = runtime.watch(makeTarget(), {
+      intervalMs: 5,
+      cadence: {
+        minIntervalMs: 5,
+        maxIntervalMs: 20,
+        idleMultiplier: 2,
+      },
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    await controller.stop()
+
+    const stored = await new FileCheckpointStore(checkpointPath).read('target-a')
+    assert.equal(stored?.observation?.cadence?.lastObservedChangeAt, '2026-04-16T01:05:01.000Z')
+    assert.equal(stored?.observation?.cadence?.lastReason, 'idle')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('watch loop honors persisted http hints within caller bounds', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
+  try {
+    const log: string[] = []
+    const checkpointStore = new FileCheckpointStore(path.join(dir, 'checkpoints.json'))
+    await checkpointStore.write({
+      observationTargetId: 'target-a',
+      source: 'example.build',
+      subject: 'example.build:acme/release',
+      lastSuccessfulPollAt: new Date(Date.now() - 30_000).toISOString(),
+      observation: {
+        http: {
+          retryAfterAt: new Date(Date.now() + 30_000).toISOString(),
+          nextPollAfter: new Date(Date.now() + 20_000).toISOString(),
+        },
+      },
+      dispatchedEventIds: [],
+    })
+
+    const runtime = new ObservationRuntime({
+      sourceAdapter: new SequencedSourceAdapter([[]]),
+      checkpointStore,
+      dispatchAdapters: [new RecordingDispatchAdapter()],
+      hooks: makeHooks(log),
+    })
+
+    const controller = runtime.watch(makeTarget(), {
+      intervalMs: 5,
+      cadence: {
+        minIntervalMs: 5,
+        maxIntervalMs: 15,
+      },
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    await controller.stop()
+
+    assert.ok(log.some((entry) => entry.startsWith('watch-cadence:retry-after:15:changed')))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('watch loop prunes expired http hint timestamps after they are consumed', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
+  try {
+    const checkpointPath = path.join(dir, 'checkpoints.json')
+    const checkpointStore = new FileCheckpointStore(checkpointPath)
+    await checkpointStore.write({
+      observationTargetId: 'target-a',
+      source: 'example.build',
+      subject: 'example.build:acme/release',
+      lastSuccessfulPollAt: new Date(Date.now() - 30_000).toISOString(),
+      observation: {
+        http: {
+          retryAfterAt: new Date(Date.now() - 1_000).toISOString(),
+          nextPollAfter: new Date(Date.now() - 1_000).toISOString(),
+        },
+      },
+      dispatchedEventIds: [],
+    })
+
+    const runtime = new ObservationRuntime({
+      sourceAdapter: {
+        source: 'example.build',
+        async poll() {
+          return {
+            events: [],
+            providerCursor: 'cursor-live',
+            polledAt: new Date().toISOString(),
+          }
+        },
+      },
+      checkpointStore,
+      dispatchAdapters: [new RecordingDispatchAdapter()],
+    })
+
+    const controller = runtime.watch(makeTarget(), {
+      intervalMs: 5,
+      cadence: {
+        minIntervalMs: 5,
+        maxIntervalMs: 15,
+      },
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    await controller.stop()
+
+    const stored = await checkpointStore.read('target-a')
+    assert.equal(stored?.observation?.http?.retryAfterAt, undefined)
+    assert.equal(stored?.observation?.http?.nextPollAfter, undefined)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('http observation event ids are state-based, so a later recurrence of the same projection stays suppressed', async () => {
+  const adapter = new HttpObservationAdapter({
+    now: () => '2026-04-16T18:05:00.000Z',
+    fetch: async () =>
+      new Response(JSON.stringify({ title: 'Recurring' }), {
+        status: 200,
+        headers: { etag: '"recurring"' },
+      }),
+  })
+
+  const target = {
+    id: 'http:json:recurring',
+    source: 'http' as const,
+    subject: 'http:https://example.test/recurring.json',
+    url: 'https://example.test/recurring.json',
+    format: 'json' as const,
+    project: (document: unknown) => ({ title: (document as { title: string }).title }),
+    dispatch: { kind: 'handler' as const, handler: async () => {} },
+  }
+
+  const first = await adapter.poll(target)
+  const second = await adapter.poll(target, {
+    observationTargetId: target.id,
+    source: target.source,
+    subject: target.subject,
+    observation: {
+      ...first.observation,
+      fingerprint: 'different-state',
+    },
+    dispatchedEventIds: first.events.map((event) => event.id),
+  })
+
+  assert.equal(first.events.length, 1)
+  assert.equal(second.events.length, 1)
+  assert.equal(first.events[0]?.id, second.events[0]?.id)
 })
