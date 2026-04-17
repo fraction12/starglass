@@ -395,7 +395,7 @@ Both stay source-agnostic. They are meant to be solid generic observation primit
 
 ## Status
 
-Current release: `v0.2.0`
+Current release: `v0.2.1`
 
 Implemented today:
 - observation runtime with restart-safe file-backed checkpointing
