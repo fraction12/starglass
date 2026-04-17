@@ -6,3 +6,5 @@ dist
 coverage
 *.tgz
 .agents/
+.superpowers/
+docs/superpowers/
