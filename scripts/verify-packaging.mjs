@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
@@ -7,8 +7,11 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 const repoRoot = process.cwd()
-const tarballName = 'starglass-0.1.0.tgz'
-const tarballPath = path.join(repoRoot, tarballName)
+
+async function resolveTarballPath() {
+  const packageJson = JSON.parse(await readFile(path.join(repoRoot, 'package.json'), 'utf8'))
+  return path.join(repoRoot, `starglass-${packageJson.version}.tgz`)
+}
 const allowedFiles = [
   'README.md',
   'dist/core.d.ts',
@@ -22,7 +25,7 @@ const allowedFiles = [
   'package.json',
 ]
 
-async function listTarballFiles() {
+async function listTarballFiles(tarballPath) {
   const { stdout } = await execFileAsync('tar', ['-tzf', tarballPath], { cwd: repoRoot })
   return stdout
     .split('\n')
@@ -33,7 +36,8 @@ async function listTarballFiles() {
 }
 
 async function run() {
-  const files = await listTarballFiles()
+  const tarballPath = await resolveTarballPath()
+  const files = await listTarballFiles(tarballPath)
   assert.deepEqual(files, [...allowedFiles].sort(), `tarball contents changed\nexpected: ${allowedFiles.join(', ')}\nreceived: ${files.join(', ')}`)
 
   const sandbox = await mkdtemp(path.join(tmpdir(), 'starglass-pack-verify-'))
