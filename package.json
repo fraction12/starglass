@@ -20,7 +20,7 @@
     "clean": "rm -rf dist",
     "build": "npm run clean && tsc -p tsconfig.build.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test \"test/**/*.test.ts\"",
+    "test": "tsx --test test/*.test.ts",
     "prepack": "npm run build",
     "verify:packaging": "node ./scripts/verify-packaging.mjs",
     "release:check": "npm run check && npm test && npm run build && npm pack --json && npm run verify:packaging",
