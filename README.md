@@ -222,7 +222,7 @@ Use a subject that stays stable across polls and process restarts. If downstream
 
 ### Event ids
 
-`event.id` should be deterministic. If the same upstream change is observed twice, the adapter should produce the same event id so Starglass can suppress duplicates safely. The built-in HTTP adapter keys event ids to the normalized projection fingerprint, which means a later return to a previously seen state reuses the same id by design.
+`event.id` should be deterministic. If the same upstream change is observed twice, the adapter should produce the same event id so Starglass can suppress duplicates safely. The built-in HTTP adapter keys event ids to the normalized projection fingerprint, which means a later return to a previously seen state reuses the same id by design. Feed entry events instead key off the stable subject, entry id, and the same meaningful revision signal used for feed change detection, so a meaningful re-emit gets a fresh event id even when the projected payload fingerprint stays the same.
 
 A practical rule is: hash the stable subject, normalized event kind, provider object id, and provider update/version marker.
 
@@ -275,6 +275,8 @@ Keep bulky or unstable provider details out of the normalized payload when possi
 See:
 - `examples/external-adapter/` for a custom external adapter
 - `examples/http-observation/` for generic HTTP observation
+- `examples/feed-observation/` for generic RSS/Atom observation
+- `examples/filesystem-observation/` for generic filesystem observation
 
 ## Long-lived watchers and hooks
 
@@ -336,6 +338,19 @@ Key commands:
 - `npm run verify:packaging` checks the tarball file list and performs a clean install/import smoke test
 - `npm run release:check` runs the full local release verification sequence
 
+## Generic feed and filesystem observation
+
+Starglass also includes built-in generic source families for feeds and the filesystem, using the same planning, checkpoint, dedupe, and projection primitives as HTTP.
+
+- `FeedObservationAdapter` observes RSS and Atom resources through a small bounded XML tag parser, normalized entry projections, and compact per-entry state that tracks entry content revision separately from projected output.
+- `FileSystemObservationAdapter` observes files or directories through normalized projection diffs and stores compact fingerprints rather than raw archives.
+
+Feed defaults are intentionally conservative: Starglass stores a compact entry-content revision fingerprint separately from the projected payload, so meaningful entry updates still emit when timestamps stay fixed and your projection intentionally omits volatile body fields. The default version signal comes from `updatedAt`, then `publishedAt`, then that compact content fingerprint. Feed event ids are derived from the entry id plus a compact revision signal that combines that version with the entry-content fingerprint, so unchanged-timestamp RSS body edits still get distinct event ids without bloating checkpoint state. You can override `entryVersion` when a feed exposes a better revision marker.
+
+Filesystem observation is projection-oriented, not archival. File targets still read `text`, `json`, or raw `bytes`. Directory targets with `includeContent: true` return UTF-8 text when content decodes cleanly, otherwise they expose base64 content with `contentEncoding: 'base64'` so binary files are represented honestly instead of being silently mangled.
+
+Both stay source-agnostic. They are meant to prove the observation chassis generalizes by family, not to start a branded connector catalog.
+
 ## Status
 
-V1.1 wedge: runtime, file-backed checkpointing, duplicate suppression, command/handler dispatch, long-lived watch loops, lifecycle hooks, strategy selection, generic HTTP observation for JSON and HTML, and bounded adaptive cadence are implemented.
+V1.1 wedge: runtime, file-backed checkpointing, duplicate suppression, command/handler dispatch, long-lived watch loops, lifecycle hooks, strategy selection, generic HTTP observation for JSON and HTML, generic RSS/Atom feed observation, generic filesystem observation, and bounded adaptive cadence are implemented.

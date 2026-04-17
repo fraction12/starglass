@@ -1,12 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import {
   CommandDispatchAdapter,
   CorruptedCheckpointStateError,
+  FeedObservationAdapter,
   FileCheckpointStore,
+  FileSystemObservationAdapter,
   HttpObservationAdapter,
   ObservationRuntime,
   defineEvent,
@@ -21,6 +23,7 @@ import {
   type DispatchAdapter,
   type DispatchEnvelope,
   type DispatchTarget,
+  type FeedEntrySnapshot,
   type ObservationEvent,
   type ObservationTarget,
   type RuntimeHooks,
@@ -1260,4 +1263,316 @@ test('http observation event ids are state-based, so a later recurrence of the s
   assert.equal(first.events.length, 1)
   assert.equal(second.events.length, 1)
   assert.equal(first.events[0]?.id, second.events[0]?.id)
+})
+
+test('feed observation emits normalized entry changes and suppresses quiet cycles', async () => {
+  const feeds = [
+    `<?xml version="1.0"?><rss version="2.0"><channel><title>Example</title><item><guid>entry-1</guid><title>First</title><link>https://example.test/1</link><description>Hello</description><pubDate>Wed, 16 Apr 2026 18:00:00 GMT</pubDate></item></channel></rss>`,
+    `<?xml version="1.0"?><rss version="2.0"><channel><title>Example</title><item><guid>entry-1</guid><title>First</title><link>https://example.test/1</link><description>Hello</description><pubDate>Wed, 16 Apr 2026 18:00:00 GMT</pubDate></item></channel></rss>`,
+  ]
+  const adapter = new FeedObservationAdapter({
+    now: () => '2026-04-16T18:05:00.000Z',
+    fetch: async () => new Response(feeds.shift(), { status: 200, headers: { 'content-type': 'application/rss+xml' } }),
+  })
+
+  const target = {
+    id: 'feed:rss:example',
+    source: 'feed' as const,
+    subject: 'feed:https://example.test/feed.xml',
+    url: 'https://example.test/feed.xml',
+    dispatch: { kind: 'handler' as const, handler: async () => {} },
+  }
+
+  const first = await adapter.poll(target)
+  const second = await adapter.poll(target, {
+    observationTargetId: target.id,
+    source: target.source,
+    subject: target.subject,
+    observation: first.observation,
+    dispatchedEventIds: first.events.map((event) => event.id),
+  })
+
+  assert.equal(first.events.length, 1)
+  assert.equal(first.events[0]?.kind, 'feed.entry.changed')
+  assert.deepEqual(first.events[0]?.payload, {
+    url: 'https://example.test/feed.xml',
+    entry: {
+      id: 'entry-1',
+      title: 'First',
+      link: 'https://example.test/1',
+      summary: 'Hello',
+      content: undefined,
+      author: undefined,
+      categories: undefined,
+      publishedAt: '2026-04-16T18:00:00.000Z',
+      updatedAt: undefined,
+    },
+    projection: {
+      id: 'entry-1',
+      link: 'https://example.test/1',
+      publishedAt: '2026-04-16T18:00:00.000Z',
+      summary: 'Hello',
+      title: 'First',
+    },
+  })
+  assert.equal(second.events.length, 0)
+  assert.ok(first.observation?.metadata?.entryFingerprints)
+})
+
+test('feed observation handles atom link attributes in arbitrary order and atom category term forms', async () => {
+  const adapter = new FeedObservationAdapter({
+    now: () => '2026-04-16T18:05:00.000Z',
+    fetch: async () => new Response(`<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><title>One</title><author><name>Jane Example</name></author><summary>Atom summary</summary><link title="Example" hreflang="en" href="https://example.test/one" rel="alternate" /><updated>2026-04-16T18:00:00Z</updated><id>tag:example.test,2026:1</id><category term="ops" /><category term="platform">Platform</category></entry></feed>`, { status: 200 }),
+  })
+
+  const target = {
+    id: 'feed:atom:attributes',
+    source: 'feed' as const,
+    subject: 'feed:https://example.test/atom.xml',
+    url: 'https://example.test/atom.xml',
+    dispatch: { kind: 'handler' as const, handler: async () => {} },
+  }
+
+  const result = await adapter.poll(target)
+
+  assert.equal(result.events.length, 1)
+  const entryPayload = result.events[0]?.payload as { entry: unknown } | undefined
+  assert.deepEqual((entryPayload?.entry as Record<string, unknown> | undefined), {
+    id: 'tag:example.test,2026:1',
+    title: 'One',
+    link: 'https://example.test/one',
+    summary: 'Atom summary',
+    content: undefined,
+    author: 'Jane Example',
+    categories: ['ops', 'Platform'],
+    publishedAt: undefined,
+    updatedAt: '2026-04-16T18:00:00.000Z',
+  })
+})
+
+test('feed observation re-emits when RSS content changes without timestamp changes even if projection omits body fields', async () => {
+  const feeds = [
+    `<?xml version="1.0"?><rss version="2.0"><channel><title>Example</title><item><guid>entry-1</guid><title>Stable</title><link>https://example.test/1</link><description>Initial body</description><pubDate>Wed, 16 Apr 2026 18:00:00 GMT</pubDate></item></channel></rss>`,
+    `<?xml version="1.0"?><rss version="2.0"><channel><title>Example</title><item><guid>entry-1</guid><title>Stable</title><link>https://example.test/1</link><description>Updated body</description><pubDate>Wed, 16 Apr 2026 18:00:00 GMT</pubDate></item></channel></rss>`,
+  ]
+  const adapter = new FeedObservationAdapter({
+    now: () => '2026-04-16T18:15:00.000Z',
+    fetch: async () => new Response(feeds.shift(), { status: 200, headers: { 'content-type': 'application/rss+xml' } }),
+  })
+
+  const target = {
+    id: 'feed:rss:projection-stable',
+    source: 'feed' as const,
+    subject: 'feed:https://example.test/rss.xml',
+    url: 'https://example.test/rss.xml',
+    projectEntry: (entry: FeedEntrySnapshot) => ({ id: entry.id, title: entry.title }),
+    dispatch: { kind: 'handler' as const, handler: async () => {} },
+  }
+
+  const first = await adapter.poll(target)
+  const second = await adapter.poll(target, {
+    observationTargetId: target.id,
+    source: target.source,
+    subject: target.subject,
+    observation: first.observation,
+    dispatchedEventIds: first.events.map((event) => event.id),
+  })
+
+  assert.equal(first.events.length, 1)
+  assert.equal(second.events.length, 1)
+  assert.notEqual(first.events[0]?.id, second.events[0]?.id)
+  const firstPayload = first.events[0]?.payload as { projection: { title?: string } } | undefined
+  const secondPayload = second.events[0]?.payload as { entry: { summary?: string; publishedAt?: string }; projection: { title?: string } } | undefined
+  assert.deepEqual(firstPayload?.projection, secondPayload?.projection)
+  assert.equal(secondPayload?.entry.summary, 'Updated body')
+  assert.equal(secondPayload?.entry.publishedAt, '2026-04-16T18:00:00.000Z')
+})
+
+test('feed observation re-emits when entry version changes even if projection fingerprint is stable', async () => {
+  const feeds = [
+    `<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>tag:example.test,2026:1</id><title>Stable</title><summary>Initial body</summary><updated>2026-04-16T18:00:00Z</updated></entry></feed>`,
+    `<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>tag:example.test,2026:1</id><title>Stable</title><summary>Updated body</summary><updated>2026-04-16T18:10:00Z</updated></entry></feed>`,
+  ]
+  const adapter = new FeedObservationAdapter({
+    now: () => '2026-04-16T18:15:00.000Z',
+    fetch: async () => new Response(feeds.shift(), { status: 200 }),
+  })
+
+  const target = {
+    id: 'feed:atom:projection-stable',
+    source: 'feed' as const,
+    subject: 'feed:https://example.test/atom.xml',
+    url: 'https://example.test/atom.xml',
+    projectEntry: (entry: FeedEntrySnapshot) => ({ id: entry.id, title: entry.title }),
+    dispatch: { kind: 'handler' as const, handler: async () => {} },
+  }
+
+  const first = await adapter.poll(target)
+  const second = await adapter.poll(target, {
+    observationTargetId: target.id,
+    source: target.source,
+    subject: target.subject,
+    observation: first.observation,
+    dispatchedEventIds: first.events.map((event) => event.id),
+  })
+
+  assert.equal(first.events.length, 1)
+  assert.equal(second.events.length, 1)
+  const firstPayload = first.events[0]?.payload as { entry: FeedEntrySnapshot; projection: { title?: string } } | undefined
+  const secondPayload = second.events[0]?.payload as { entry: FeedEntrySnapshot; projection: { title?: string } } | undefined
+  assert.equal(firstPayload?.projection.title, secondPayload?.projection.title)
+  assert.notDeepEqual(firstPayload?.entry, secondPayload?.entry)
+  assert.notEqual(first.events[0]?.id, second.events[0]?.id)
+  assert.equal(secondPayload?.entry.summary, 'Updated body')
+  assert.equal(secondPayload?.entry.updatedAt, '2026-04-16T18:10:00.000Z')
+})
+
+test('feed observation resumes compact entry fingerprint state after restart', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
+  try {
+    const checkpointPath = path.join(dir, 'checkpoints.json')
+    const feed = `<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>Example</title><entry><id>tag:example.test,2026:1</id><title>One</title><link href="https://example.test/one" rel="alternate" /><updated>2026-04-16T18:00:00Z</updated><summary>Atom summary</summary></entry></feed>`
+    const runtime = new ObservationRuntime<any>({
+      sourceAdapter: new FeedObservationAdapter({
+        now: () => '2026-04-16T18:05:00.000Z',
+        fetch: async () => new Response(feed, { status: 200 }),
+      }),
+      checkpointStore: new FileCheckpointStore(checkpointPath),
+      dispatchAdapters: [new RecordingDispatchAdapter()],
+    })
+
+    const target = {
+      id: 'feed:atom:example',
+      source: 'feed' as const,
+      subject: 'feed:https://example.test/atom.xml',
+      url: 'https://example.test/atom.xml',
+      dispatch: { kind: 'handler' as const, handler: async () => {} },
+    }
+
+    const first = await runtime.poll(target)
+    const second = await runtime.poll(target)
+    const stored = await new FileCheckpointStore(checkpointPath).read(target.id)
+    const raw = await readFile(checkpointPath, 'utf8')
+
+    assert.equal(first.length, 1)
+    assert.equal(second.length, 0)
+    assert.ok(stored?.observation?.metadata?.entryFingerprints)
+    assert.doesNotMatch(raw, /Atom summary/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('filesystem observation suppresses raw file churn when projection is unchanged', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
+  try {
+    const filePath = path.join(dir, 'status.json')
+    await writeFile(filePath, JSON.stringify({ title: 'Stable', noisy: 1 }), 'utf8')
+
+    const adapter = new FileSystemObservationAdapter({
+      now: () => '2026-04-16T18:05:00.000Z',
+    })
+
+    const target = {
+      id: 'filesystem:file:status',
+      source: 'filesystem' as const,
+      subject: `filesystem:${filePath}`,
+      path: filePath,
+      kind: 'file' as const,
+      read: 'json' as const,
+      project: (document: unknown) => ({ title: (document as { title: string }).title }),
+      dispatch: { kind: 'handler' as const, handler: async () => {} },
+    }
+
+    const first = await adapter.poll(target)
+    await writeFile(filePath, JSON.stringify({ title: 'Stable', noisy: 2 }), 'utf8')
+    const second = await adapter.poll(target, {
+      observationTargetId: target.id,
+      source: target.source,
+      subject: target.subject,
+      observation: first.observation,
+      dispatchedEventIds: first.events.map((event) => event.id),
+    })
+
+    assert.equal(first.events.length, 1)
+    assert.equal(second.events.length, 0)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('filesystem observation exposes binary directory content as base64 when includeContent is enabled', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
+  try {
+    const watchDir = path.join(dir, 'watched')
+    await mkdir(watchDir, { recursive: true })
+    await writeFile(path.join(watchDir, 'blob.bin'), Buffer.from([0, 255, 1, 2]))
+
+    const adapter = new FileSystemObservationAdapter({
+      now: () => '2026-04-16T18:05:00.000Z',
+    })
+
+    const target = {
+      id: 'filesystem:dir:binary',
+      source: 'filesystem' as const,
+      subject: `filesystem:${watchDir}`,
+      path: watchDir,
+      kind: 'directory' as const,
+      includeContent: true,
+      dispatch: { kind: 'handler' as const, handler: async () => {} },
+    }
+
+    const result = await adapter.poll(target)
+    assert.equal(result.events.length, 1)
+    const directoryPayload = result.events[0]?.payload as { projection: unknown } | undefined
+    assert.deepEqual(directoryPayload?.projection, [{
+      content: 'AP8BAg==',
+      contentEncoding: 'base64',
+      path: 'blob.bin',
+      size: 4,
+      type: 'file',
+    }])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('filesystem observation persists compact restart-safe state for directories', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'starglass-'))
+  try {
+    const watchDir = path.join(dir, 'watched')
+    await mkdir(watchDir, { recursive: true })
+    await writeFile(path.join(watchDir, 'note.txt'), 'hello\n', 'utf8')
+
+    const checkpointPath = path.join(dir, 'checkpoints.json')
+    const runtime = new ObservationRuntime<any>({
+      sourceAdapter: new FileSystemObservationAdapter({
+        now: () => '2026-04-16T18:05:00.000Z',
+      }),
+      checkpointStore: new FileCheckpointStore(checkpointPath),
+      dispatchAdapters: [new RecordingDispatchAdapter()],
+    })
+
+    const target = {
+      id: 'filesystem:dir:notes',
+      source: 'filesystem' as const,
+      subject: `filesystem:${watchDir}`,
+      path: watchDir,
+      kind: 'directory' as const,
+      recursive: true,
+      projectEntry: (entry: { path: string; type: 'file' | 'directory' }) => ({ path: entry.path, type: entry.type }),
+      dispatch: { kind: 'handler' as const, handler: async () => {} },
+    }
+
+    const first = await runtime.poll(target)
+    const second = await runtime.poll(target)
+    const raw = await readFile(checkpointPath, 'utf8')
+
+    assert.equal(first.length, 1)
+    assert.equal(second.length, 0)
+    assert.doesNotMatch(raw, /hello/)
+    assert.ok((await new FileCheckpointStore(checkpointPath).read(target.id))?.observation?.fingerprint)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })

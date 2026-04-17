@@ -272,102 +272,127 @@ export interface RuntimeHooks<TTarget extends ObservationTarget = ObservationTar
   onWatchStarted?: (payload: WatchStartedHookPayload<TTarget>) => void | Promise<void>
   onWatchCycleFailed?: (payload: WatchCycleFailedHookPayload<TTarget>) => void | Promise<void>
   onWatchBackoff?: (payload: WatchBackoffHookPayload<TTarget>) => void | Promise<void>
-  onWatchCadencePlanned?: (payload: WatchCadenceHookPayload<TTarget>) => void | Promise<void>
   onWatchStopped?: (payload: WatchStoppedHookPayload<TTarget>) => void | Promise<void>
+  onWatchCadencePlanned?: (payload: WatchCadenceHookPayload<TTarget>) => void | Promise<void>
   onObservationPlanSelected?: (payload: ObservationPlanSelectedHookPayload<TTarget>) => void | Promise<void>
 }
 
 export interface WatchOptions {
   intervalMs: number
-  backoffMs?: number
-  maxBackoffMs?: number
-  maxConsecutiveFailures?: number
+  backoffMs?: number | undefined
+  maxBackoffMs?: number | undefined
+  maxConsecutiveFailures?: number | undefined
   cadence?: AdaptiveCadenceOptions | undefined
 }
 
 export interface WatchController {
   stop(): Promise<void>
-  readonly stopped: Promise<void>
+  stopped: Promise<void>
+}
+
+export class CommandDispatchAdapter implements DispatchAdapter<CommandDispatchTarget> {
+  supports(target: DispatchTarget): target is CommandDispatchTarget {
+    return target.kind === 'command'
+  }
+
+  async dispatch(envelope: DispatchEnvelope, target: CommandDispatchTarget): Promise<void> {
+    const child = spawn(target.command, target.args ?? [], {
+      cwd: target.cwd,
+      env: {
+        ...process.env,
+        ...(target.env ?? {}),
+      },
+      stdio: ['pipe', 'inherit', 'inherit'],
+    })
+
+    await new Promise<void>((resolve, reject) => {
+      child.on('error', reject)
+      child.on('exit', (code) => {
+        if (code === 0) {
+          resolve()
+        } else {
+          reject(new Error(`Command dispatch exited with code ${code ?? 'unknown'}`))
+        }
+      })
+      child.stdin.end(`${JSON.stringify(envelope)}\n`)
+    })
+  }
 }
 
 export class FileCheckpointStore implements CheckpointStore {
-  constructor(private readonly filePath: string) {}
+  private readonly directory: string
+
+  constructor(readonly filePath: string) {
+    this.directory = path.dirname(filePath)
+  }
 
   async read(targetId: string): Promise<CheckpointRecord | undefined> {
-    const state = await this.readState()
+    const state = await this.readAll()
     return state[targetId]
   }
 
   async write(record: CheckpointRecord): Promise<void> {
-    const state = await this.readState()
-    state[record.observationTargetId] = record
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true })
-    await this.writeStateAtomically(state)
-  }
+    await fs.mkdir(this.directory, { recursive: true })
+    const current = await this.readAll()
+    current[record.observationTargetId] = record
 
-  private async readState(): Promise<Record<string, CheckpointRecord>> {
-    try {
-      const raw = await fs.readFile(this.filePath, 'utf8')
-      return this.parseState(raw)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return {}
-      }
-      throw this.wrapStateReadError(error)
-    }
-  }
-
-  private parseState(raw: string): Record<string, CheckpointRecord> {
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(raw)
-    } catch (error) {
-      throw new CorruptedCheckpointStateError(this.filePath, 'invalid JSON', { cause: error })
-    }
-
-    if (!isCheckpointStateRecord(parsed)) {
-      throw new CorruptedCheckpointStateError(this.filePath, 'expected an object keyed by observation target id')
-    }
-
-    return parsed
-  }
-
-  private async writeStateAtomically(state: Record<string, CheckpointRecord>): Promise<void> {
-    const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`
-    const payload = `${JSON.stringify(state, null, 2)}\n`
+    const tempPath = path.join(this.directory, `${path.basename(this.filePath)}.${randomUUID()}.tmp`)
+    await fs.writeFile(tempPath, `${JSON.stringify(current, null, 2)}\n`, 'utf8')
 
     try {
-      await fs.writeFile(tempPath, payload, 'utf8')
       await this.rename(tempPath, this.filePath)
     } catch (error) {
-      await fs.rm(tempPath, { force: true }).catch(() => undefined)
+      await fs.rm(tempPath, { force: true }).catch(() => {})
       throw error
     }
   }
 
-  protected async rename(fromPath: string, toPath: string): Promise<void> {
-    await fs.rename(fromPath, toPath)
+  protected async rename(from?: string, to?: string): Promise<void> {
+    if (!from || !to) {
+      return
+    }
+    await fs.rename(from, to)
   }
 
-  private wrapStateReadError(error: unknown): Error {
-    if (error instanceof CheckpointStateError) {
-      return error
+  private async readAll(): Promise<Record<string, CheckpointRecord>> {
+    try {
+      const raw = await fs.readFile(this.filePath, 'utf8')
+      const parsed = JSON.parse(raw) as unknown
+      return this.validateState(parsed)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        return {}
+      }
+      if (error instanceof CorruptedCheckpointStateError) {
+        throw error
+      }
+      if (error instanceof SyntaxError) {
+        throw new CorruptedCheckpointStateError(this.filePath, 'invalid JSON', { cause: error })
+      }
+      throw new CorruptedCheckpointStateError(this.filePath, 'unexpected read failure', { cause: error })
+    }
+  }
+
+  private validateState(value: unknown): Record<string, CheckpointRecord> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new CorruptedCheckpointStateError(this.filePath, 'expected an object keyed by observation target id')
     }
 
-    const detail = error instanceof Error ? error.message : 'unknown read error'
-    return new CorruptedCheckpointStateError(this.filePath, detail, { cause: error })
+    const state = value as Record<string, unknown>
+    const validated: Record<string, CheckpointRecord> = {}
+
+    for (const [key, record] of Object.entries(state)) {
+      if (!isCheckpointRecord(record, key)) {
+        throw new CorruptedCheckpointStateError(this.filePath, 'expected an object keyed by observation target id')
+      }
+      validated[key] = record
+    }
+
+    return validated
   }
 }
 
-function isCheckpointStateRecord(value: unknown): value is Record<string, CheckpointRecord> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return false
-  }
-
-  return Object.entries(value).every(([targetId, record]) => isCheckpointRecord(targetId, record))
-}
-
-function isCheckpointRecord(targetId: string, value: unknown): value is CheckpointRecord {
+function isCheckpointRecord(value: unknown, targetId: string): value is CheckpointRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return false
   }
@@ -379,9 +404,9 @@ function isCheckpointRecord(targetId: string, value: unknown): value is Checkpoi
     typeof record.subject === 'string' &&
     (record.providerCursor === undefined || typeof record.providerCursor === 'string') &&
     (record.lastSuccessfulPollAt === undefined || typeof record.lastSuccessfulPollAt === 'string') &&
-    (record.observation === undefined || isObservationCheckpointState(record.observation)) &&
     Array.isArray(record.dispatchedEventIds) &&
-    record.dispatchedEventIds.every((eventId) => typeof eventId === 'string')
+    record.dispatchedEventIds.every((eventId) => typeof eventId === 'string') &&
+    (record.observation === undefined || isObservationCheckpointState(record.observation))
   )
 }
 
@@ -392,11 +417,12 @@ function isObservationCheckpointState(value: unknown): value is ObservationCheck
 
   const state = value as Partial<ObservationCheckpointState>
   return (
-    (state.fingerprint === undefined || typeof state.fingerprint === 'string') &&
     (state.strategy === undefined || isObservationStrategy(state.strategy)) &&
     (state.plan === undefined || isObservationPlan(state.plan)) &&
     (state.http === undefined || isHttpValidators(state.http)) &&
-    (state.metadata === undefined || isStringRecord(state.metadata))
+    (state.cadence === undefined || isObservationCadenceState(state.cadence)) &&
+    (state.fingerprint === undefined || typeof state.fingerprint === 'string') &&
+    (state.metadata === undefined || isStringMap(state.metadata))
   )
 }
 
@@ -455,7 +481,16 @@ function isObservationStrategy(value: unknown): value is ObservationStrategy {
   }
 
   const strategy = value as Partial<ObservationStrategy>
-  return typeof strategy.mode === 'string' && typeof strategy.reason === 'string'
+  return isObservationStrategyMode(strategy.mode) && typeof strategy.reason === 'string'
+}
+
+function isObservationStrategyMode(value: unknown): value is ObservationStrategyMode {
+  return value === 'push'
+    || value === 'conditional'
+    || value === 'cursor'
+    || value === 'probe-then-fetch'
+    || value === 'projection-diff'
+    || value === 'snapshot-diff'
 }
 
 function isHttpValidators(value: unknown): value is HttpValidators {
@@ -472,46 +507,37 @@ function isHttpValidators(value: unknown): value is HttpValidators {
   )
 }
 
-function isStringRecord(value: unknown): value is Record<string, string> {
+function isObservationCadenceState(value: unknown): value is ObservationCadenceState {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return false
   }
 
-  return Object.values(value).every((entry) => typeof entry === 'string')
+  const cadence = value as Partial<ObservationCadenceState>
+  return (
+    (cadence.idleStreak === undefined || typeof cadence.idleStreak === 'number') &&
+    (cadence.currentDelayMs === undefined || typeof cadence.currentDelayMs === 'number') &&
+    (cadence.lastReason === undefined || isCadenceReason(cadence.lastReason)) &&
+    (cadence.lastPlannedAt === undefined || typeof cadence.lastPlannedAt === 'string') &&
+    (cadence.nextAttemptAt === undefined || typeof cadence.nextAttemptAt === 'string') &&
+    (cadence.lastObservedChangeAt === undefined || typeof cadence.lastObservedChangeAt === 'string')
+  )
 }
 
-export class CommandDispatchAdapter implements DispatchAdapter<CommandDispatchTarget> {
-  supports(target: DispatchTarget): target is CommandDispatchTarget {
-    return target.kind === 'command'
+function isCadenceReason(value: unknown): value is CadenceReason {
+  return value === 'base'
+    || value === 'activity'
+    || value === 'idle'
+    || value === 'retry-after'
+    || value === 'cache-control'
+    || value === 'failure-backoff'
+}
+
+function isStringMap(value: unknown): value is Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false
   }
 
-  async dispatch(envelope: DispatchEnvelope, target: CommandDispatchTarget): Promise<void> {
-    const payload = JSON.stringify(envelope)
-
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(target.command, target.args ?? [], {
-        cwd: target.cwd,
-        env: { ...process.env, ...(target.env ?? {}) },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      })
-
-      let stderr = ''
-      child.stderr.on('data', (chunk) => {
-        stderr += chunk.toString()
-      })
-
-      child.on('error', reject)
-      child.on('close', (code) => {
-        if (code === 0) {
-          resolve()
-          return
-        }
-        reject(new Error(`Command dispatch failed with exit code ${code}${stderr ? `: ${stderr.trim()}` : ''}`))
-      })
-
-      child.stdin.end(payload)
-    })
-  }
+  return Object.values(value as Record<string, unknown>).every((entry) => typeof entry === 'string')
 }
 
 export class ObservationRuntime<TTarget extends ObservationTarget = ObservationTarget> {
@@ -951,6 +977,78 @@ export const html = {
   }),
 }
 
+export interface FeedTargetBase extends ObservationTarget {
+  source: 'feed'
+  url: string
+  headers?: Record<string, string>
+}
+
+export interface FeedEntrySnapshot {
+  id: string
+  title?: string | undefined
+  link?: string | undefined
+  summary?: string | undefined
+  content?: string | undefined
+  author?: string | undefined
+  categories?: string[] | undefined
+  publishedAt?: string | undefined
+  updatedAt?: string | undefined
+}
+
+export type FeedProjection = (entry: FeedEntrySnapshot) => unknown
+
+export interface FeedObservationTarget extends FeedTargetBase {
+  projectEntry?: FeedProjection | undefined
+  entryVersion?: ((entry: FeedEntrySnapshot) => string | number | boolean | null | undefined) | undefined
+}
+
+export interface FeedObservationOptions {
+  fetch?: typeof fetch
+  now?: () => string
+}
+
+interface FeedEntryState {
+  version: string
+  fingerprint: string
+}
+
+export interface FileSystemTargetBase extends ObservationTarget {
+  source: 'filesystem'
+  path: string
+}
+
+export interface FileSystemFileObservationTarget extends FileSystemTargetBase {
+  kind: 'file'
+  read?: 'text' | 'json' | 'bytes' | undefined
+  project?: ((input: string | Uint8Array | unknown) => unknown) | undefined
+}
+
+export interface FileSystemDirectoryEntrySnapshot {
+  path: string
+  type: 'file' | 'directory'
+  size?: number | undefined
+  content?: string | unknown | undefined
+  contentEncoding?: 'utf8' | 'base64' | undefined
+}
+
+export interface FileSystemDirectoryObservationTarget extends FileSystemTargetBase {
+  kind: 'directory'
+  recursive?: boolean | undefined
+  includeContent?: boolean | undefined
+  projectEntry?: ((entry: FileSystemDirectoryEntrySnapshot) => unknown) | undefined
+}
+
+interface EncodedFileContent {
+  value: string
+  encoding: 'utf8' | 'base64'
+}
+
+export type FileSystemObservationTarget = FileSystemFileObservationTarget | FileSystemDirectoryObservationTarget
+
+export interface FileSystemObservationOptions {
+  now?: () => string
+}
+
 export class HttpObservationAdapter implements SourceAdapter<HttpObservationTarget> {
   readonly source = 'http'
   private readonly fetchImpl: typeof fetch
@@ -1055,6 +1153,165 @@ export class HttpObservationAdapter implements SourceAdapter<HttpObservationTarg
         strategy,
         plan,
         http: validators,
+        fingerprint,
+      },
+    })
+  }
+}
+
+export class FeedObservationAdapter implements SourceAdapter<FeedObservationTarget> {
+  readonly source = 'feed'
+  private readonly fetchImpl: typeof fetch
+  private readonly now: () => string
+
+  constructor(options: FeedObservationOptions = {}) {
+    this.fetchImpl = options.fetch ?? fetch
+    this.now = options.now ?? (() => new Date().toISOString())
+  }
+
+  capabilities(_target?: FeedObservationTarget, _checkpoint?: CheckpointRecord): ObservationCapabilities {
+    return {
+      projectionDiff: true,
+      snapshotDiff: true,
+    }
+  }
+
+  async poll(target: FeedObservationTarget, checkpoint?: CheckpointRecord): Promise<SourcePollResult> {
+    const response = await this.fetchImpl(target.url, {
+      method: 'GET',
+      headers: new Headers(target.headers ?? {}),
+    })
+
+    if (!response.ok) {
+      throw new Error(`Feed observation failed with status ${response.status} for ${target.url}`)
+    }
+
+    const polledAt = this.now()
+    const plan = resolveObservationPlan(target.observationCapabilities, this.capabilities(target, checkpoint), checkpoint)
+    const strategy = plan.strategy
+    const xml = await response.text()
+    const entries = parseFeedEntries(xml).map((entry) => ({
+      ...entry,
+      categories: entry.categories ? [...entry.categories] : undefined,
+    }))
+
+    const previousMap = decodeFeedEntryStateMap(checkpoint?.observation?.metadata?.entryFingerprints)
+    const nextMap = new Map<string, FeedEntryState>()
+    const events: ObservationEvent[] = []
+
+    for (const entry of entries) {
+      const projection = normalizeProjection((target.projectEntry ?? defaultFeedEntryProjection)(entry))
+      const fingerprint = stableFingerprint(projection)
+      const version = resolveFeedEntryVersion(entry, target.entryVersion)
+      const contentFingerprint = feedEntryContentFingerprint(entry)
+      const revision = resolveFeedEntryRevision(version, contentFingerprint)
+      nextMap.set(entry.id, { version, fingerprint: contentFingerprint })
+
+      const previous = previousMap.get(entry.id)
+      if (previous && previous.version === version && previous.fingerprint === contentFingerprint) {
+        continue
+      }
+
+      const occurredAt = entry.updatedAt ?? entry.publishedAt ?? polledAt
+      events.push(defineEvent({
+        id: stableEventId(target.subject, entry.id, revision),
+        kind: 'feed.entry.changed',
+        source: this.source,
+        subject: target.subject,
+        occurredAt,
+        payload: {
+          url: target.url,
+          entry,
+          projection,
+        },
+        sourceRef: {
+          provider: 'feed',
+          type: 'entry',
+          id: entry.id,
+          url: entry.link ?? target.url,
+        },
+      }))
+    }
+
+    events.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id))
+
+    return makePollResult({
+      events,
+      polledAt,
+      observation: {
+        strategy,
+        plan,
+        fingerprint: stableFingerprint(serializeFeedEntryStateMap(nextMap)),
+        metadata: {
+          entryFingerprints: serializeFeedEntryStateMap(nextMap),
+        },
+      },
+    })
+  }
+}
+
+export class FileSystemObservationAdapter implements SourceAdapter<FileSystemObservationTarget> {
+  readonly source = 'filesystem'
+  private readonly now: () => string
+
+  constructor(options: FileSystemObservationOptions = {}) {
+    this.now = options.now ?? (() => new Date().toISOString())
+  }
+
+  capabilities(_target?: FileSystemObservationTarget, _checkpoint?: CheckpointRecord): ObservationCapabilities {
+    return {
+      projectionDiff: true,
+      snapshotDiff: true,
+    }
+  }
+
+  async poll(target: FileSystemObservationTarget, checkpoint?: CheckpointRecord): Promise<SourcePollResult> {
+    const polledAt = this.now()
+    const plan = resolveObservationPlan(target.observationCapabilities, this.capabilities(target, checkpoint), checkpoint)
+    const strategy = plan.strategy
+
+    const projection = target.kind === 'file'
+      ? await observeFileTarget(target)
+      : await observeDirectoryTarget(target)
+    const normalizedProjection = normalizeProjection(projection)
+    const fingerprint = stableFingerprint(normalizedProjection)
+
+    if (checkpoint?.observation?.fingerprint === fingerprint) {
+      return makePollResult({
+        events: [],
+        polledAt,
+        observation: {
+          strategy,
+          plan,
+          fingerprint,
+        },
+      })
+    }
+
+    const event = defineEvent({
+      id: stableEventId(target.subject, fingerprint),
+      kind: target.kind === 'file' ? 'filesystem.file.changed' : 'filesystem.directory.changed',
+      source: this.source,
+      subject: target.subject,
+      occurredAt: polledAt,
+      payload: {
+        path: target.path,
+        kind: target.kind,
+        projection: normalizedProjection,
+      },
+      sourceRef: {
+        provider: 'filesystem',
+        type: target.kind,
+        id: target.path,
+      },
+    })
+
+    return makePollResult({
+      events: [event],
+      polledAt,
+      observation: {
+        strategy,
+        plan,
         fingerprint,
       },
     })
@@ -1192,6 +1449,596 @@ function normalizeProjection(value: unknown): unknown {
 
 function stableFingerprint(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(normalizeProjection(value))).digest('hex')
+}
+
+function defaultFeedEntryProjection(entry: FeedEntrySnapshot): unknown {
+  return {
+    id: entry.id,
+    title: entry.title,
+    link: entry.link,
+    summary: entry.summary,
+    author: entry.author,
+    categories: entry.categories,
+    publishedAt: entry.publishedAt,
+    updatedAt: entry.updatedAt,
+  }
+}
+
+function feedEntryContentFingerprint(entry: FeedEntrySnapshot): string {
+  return stableFingerprint({
+    title: entry.title,
+    summary: entry.summary,
+    content: entry.content,
+    author: entry.author,
+    categories: entry.categories,
+    link: entry.link,
+    publishedAt: entry.publishedAt,
+    updatedAt: entry.updatedAt,
+  })
+}
+
+function resolveFeedEntryVersion(
+  entry: FeedEntrySnapshot,
+  customVersion?: (entry: FeedEntrySnapshot) => string | number | boolean | null | undefined,
+): string {
+  const explicit = customVersion?.(entry)
+  if (explicit !== undefined && explicit !== null) {
+    return String(explicit)
+  }
+
+  return entry.updatedAt
+    ?? entry.publishedAt
+    ?? feedEntryContentFingerprint(entry)
+}
+
+function resolveFeedEntryRevision(version: string, contentFingerprint: string): string {
+  return stableFingerprint({ version, contentFingerprint })
+}
+
+function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&#(x?[0-9a-f]+);/giu, (_match, entity: string) => {
+      const codePoint = entity[0]?.toLowerCase() === 'x'
+        ? Number.parseInt(entity.slice(1), 16)
+        : Number.parseInt(entity, 10)
+      return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : _match
+    })
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+function stripCdata(value: string): string {
+  return value.replace(/^<!\[CDATA\[([\s\S]*)\]\]>$/u, '$1')
+}
+
+function cleanText(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined
+  }
+
+  const normalized = decodeXmlEntities(stripCdata(value).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim())
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function cleanContent(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined
+  }
+
+  const normalized = decodeXmlEntities(stripCdata(value).trim())
+  return normalized.length > 0 ? normalized : undefined
+}
+
+type FeedNode = {
+  name: string
+  attributes: Record<string, string>
+  innerXml?: string
+}
+
+function parseFeedEntries(xml: string): FeedEntrySnapshot[] {
+  const channel = findFirstNodeAnywhere(xml, ['channel'])
+  const feed = findFirstNodeAnywhere(xml, ['feed'])
+  const items = findDirectChildNodes(channel?.innerXml ?? xml, 'item').map((node) => ({ kind: 'rss' as const, node }))
+  const entries = findDirectChildNodes(feed?.innerXml ?? xml, 'entry').map((node) => ({ kind: 'atom' as const, node }))
+  const blocks = items.length > 0 ? items : entries
+
+  return blocks.map(({ kind, node }, index) => {
+    const id = firstNodeText(node, kind === 'rss' ? ['guid', 'id', 'link', 'title'] : ['id', 'link', 'title']) ?? `entry-${index}`
+    return {
+      id,
+      title: firstNodeText(node, ['title']),
+      link: findFeedLink(node),
+      summary: firstNodeText(node, ['description', 'summary']),
+      content: firstNodeContent(node, ['content:encoded', 'content']),
+      author: findAuthor(node),
+      categories: (() => {
+        const values = findFeedCategories(node)
+        return values.length > 0 ? values : undefined
+      })(),
+      publishedAt: toIsoDate(firstNodeText(node, ['pubDate', 'published', 'issued'])),
+      updatedAt: toIsoDate(firstNodeText(node, ['updated', 'modified'])),
+    }
+  })
+}
+
+function findFeedLink(node: FeedNode): string | undefined {
+  const links = findDirectChildNodes(node.innerXml ?? '', 'link')
+  const alternate = links.find((link) => {
+    const rel = link.attributes.rel?.toLowerCase()
+    return rel === undefined || rel === 'alternate'
+  })
+
+  if (alternate?.attributes.href) {
+    return decodeXmlEntities(alternate.attributes.href)
+  }
+
+  const anyHref = links.find((link) => link.attributes.href)
+  if (anyHref?.attributes.href) {
+    return decodeXmlEntities(anyHref.attributes.href)
+  }
+
+  return firstNodeText(node, ['link'])
+}
+
+function findAuthor(node: FeedNode): string | undefined {
+  const author = findFirstDirectChildNode(node.innerXml ?? '', ['author', 'dc:creator'])
+  if (!author) {
+    return undefined
+  }
+
+  return firstNodeText(author, ['name'])
+    ?? cleanText(author.innerXml)
+}
+
+function firstNodeText(node: FeedNode, names: string[]): string | undefined {
+  const child = findFirstDirectChildNode(node.innerXml ?? '', names)
+  return child ? cleanText(child.innerXml) : undefined
+}
+
+function firstNodeContent(node: FeedNode, names: string[]): string | undefined {
+  const child = findFirstDirectChildNode(node.innerXml ?? '', names)
+  return child ? cleanContent(child.innerXml) : undefined
+}
+
+function allNodeTexts(node: FeedNode, names: string[]): string[] {
+  return names.flatMap((name) => findDirectChildNodes(node.innerXml ?? '', name))
+    .map((child) => cleanText(child.innerXml))
+    .filter((value): value is string => value !== undefined)
+}
+
+function findFeedCategories(node: FeedNode): string[] {
+  return findDirectChildNodes(node.innerXml ?? '', 'category')
+    .flatMap((child) => {
+      const text = cleanText(child.innerXml)
+      if (text !== undefined) {
+        return [text]
+      }
+
+      const term = child.attributes.term
+      if (term !== undefined) {
+        const normalized = cleanText(term)
+        return normalized !== undefined ? [normalized] : []
+      }
+
+      return []
+    })
+}
+
+function findFirstDirectChildNode(xml: string, names: string[]): FeedNode | undefined {
+  for (const name of names) {
+    const node = findDirectChildNodes(xml, name)[0]
+    if (node) {
+      return node
+    }
+  }
+  return undefined
+}
+
+function findFirstNodeAnywhere(xml: string, names: string[]): FeedNode | undefined {
+  for (const name of names) {
+    const node = findNodesAnywhere(xml, name)[0]
+    if (node) {
+      return node
+    }
+  }
+  return undefined
+}
+
+function findNodesAnywhere(xml: string, name: string): FeedNode[] {
+  const nodes: FeedNode[] = []
+  const lowerName = name.toLowerCase()
+  let index = 0
+
+  while (index < xml.length) {
+    const start = xml.indexOf('<', index)
+    if (start === -1) {
+      break
+    }
+
+    if (xml.startsWith('<!--', start)) {
+      const commentEnd = xml.indexOf('-->', start + 4)
+      index = commentEnd === -1 ? xml.length : commentEnd + 3
+      continue
+    }
+
+    if (xml.startsWith('<![CDATA[', start)) {
+      const cdataEnd = xml.indexOf(']]>', start + 9)
+      index = cdataEnd === -1 ? xml.length : cdataEnd + 3
+      continue
+    }
+
+    const end = findTagEnd(xml, start)
+    if (end === -1) {
+      break
+    }
+
+    const rawTag = xml.slice(start + 1, end).trim()
+    if (rawTag.startsWith('?') || rawTag.startsWith('!')) {
+      index = end + 1
+      continue
+    }
+
+    const closing = rawTag.startsWith('/')
+    const selfClosing = !closing && rawTag.endsWith('/')
+    const tagBody = closing ? rawTag.slice(1).trim() : selfClosing ? rawTag.slice(0, -1).trim() : rawTag
+    const parsed = parseTag(tagBody)
+    if (!parsed || parsed.name.toLowerCase() !== lowerName) {
+      index = end + 1
+      continue
+    }
+
+    if (closing) {
+      index = end + 1
+      continue
+    }
+
+    if (selfClosing) {
+      nodes.push({ name: parsed.name, attributes: parsed.attributes, innerXml: '' })
+      index = end + 1
+      continue
+    }
+
+    const close = findClosingTag(xml, parsed.name, end + 1)
+    if (!close) {
+      throw new Error(`Feed parser encountered an unclosed <${parsed.name}> block`)
+    }
+
+    nodes.push({
+      name: parsed.name,
+      attributes: parsed.attributes,
+      innerXml: xml.slice(end + 1, close.start),
+    })
+    index = close.end + 1
+  }
+
+  return nodes
+}
+
+function findDirectChildNodes(xml: string, name: string): FeedNode[] {
+  const nodes: FeedNode[] = []
+  const lowerName = name.toLowerCase()
+  let index = 0
+  let depth = 0
+
+  while (index < xml.length) {
+    const start = xml.indexOf('<', index)
+    if (start === -1) {
+      break
+    }
+
+    if (xml.startsWith('<!--', start)) {
+      const commentEnd = xml.indexOf('-->', start + 4)
+      index = commentEnd === -1 ? xml.length : commentEnd + 3
+      continue
+    }
+
+    if (xml.startsWith('<![CDATA[', start)) {
+      const cdataEnd = xml.indexOf(']]>', start + 9)
+      index = cdataEnd === -1 ? xml.length : cdataEnd + 3
+      continue
+    }
+
+    const end = findTagEnd(xml, start)
+    if (end === -1) {
+      break
+    }
+
+    const rawTag = xml.slice(start + 1, end).trim()
+    if (rawTag.startsWith('?') || rawTag.startsWith('!')) {
+      index = end + 1
+      continue
+    }
+
+    const closing = rawTag.startsWith('/')
+    const selfClosing = !closing && rawTag.endsWith('/')
+    const tagBody = closing ? rawTag.slice(1).trim() : selfClosing ? rawTag.slice(0, -1).trim() : rawTag
+    const parsed = parseTag(tagBody)
+    if (!parsed) {
+      index = end + 1
+      continue
+    }
+
+    if (closing) {
+      depth = Math.max(0, depth - 1)
+      index = end + 1
+      continue
+    }
+
+    const currentDepth = depth
+    depth += selfClosing ? 0 : 1
+
+    if (currentDepth !== 0 || parsed.name.toLowerCase() !== lowerName) {
+      index = end + 1
+      continue
+    }
+
+    if (selfClosing) {
+      nodes.push({ name: parsed.name, attributes: parsed.attributes, innerXml: '' })
+      index = end + 1
+      continue
+    }
+
+    const close = findClosingTag(xml, parsed.name, end + 1)
+    if (!close) {
+      throw new Error(`Feed parser encountered an unclosed <${parsed.name}> block`)
+    }
+
+    nodes.push({
+      name: parsed.name,
+      attributes: parsed.attributes,
+      innerXml: xml.slice(end + 1, close.start),
+    })
+    index = close.end + 1
+    depth = 0
+  }
+
+  return nodes
+}
+
+function findClosingTag(xml: string, name: string, from: number): { start: number; end: number } | undefined {
+  const lowerName = name.toLowerCase()
+  let depth = 1
+  let index = from
+
+  while (index < xml.length) {
+    const start = xml.indexOf('<', index)
+    if (start === -1) {
+      return undefined
+    }
+
+    if (xml.startsWith('<!--', start)) {
+      const commentEnd = xml.indexOf('-->', start + 4)
+      index = commentEnd === -1 ? xml.length : commentEnd + 3
+      continue
+    }
+
+    if (xml.startsWith('<![CDATA[', start)) {
+      const cdataEnd = xml.indexOf(']]>', start + 9)
+      index = cdataEnd === -1 ? xml.length : cdataEnd + 3
+      continue
+    }
+
+    const end = findTagEnd(xml, start)
+    if (end === -1) {
+      return undefined
+    }
+
+    const rawTag = xml.slice(start + 1, end).trim()
+    if (rawTag.startsWith('?') || rawTag.startsWith('!')) {
+      index = end + 1
+      continue
+    }
+
+    const closing = rawTag.startsWith('/')
+    const selfClosing = !closing && rawTag.endsWith('/')
+    const tagBody = closing ? rawTag.slice(1).trim() : selfClosing ? rawTag.slice(0, -1).trim() : rawTag
+    const parsed = parseTag(tagBody)
+    if (!parsed || parsed.name.toLowerCase() !== lowerName) {
+      index = end + 1
+      continue
+    }
+
+    if (closing) {
+      depth -= 1
+      if (depth === 0) {
+        return { start, end }
+      }
+    } else if (!selfClosing) {
+      depth += 1
+    }
+
+    index = end + 1
+  }
+
+  return undefined
+}
+
+function findTagEnd(xml: string, start: number): number {
+  let quote: string | undefined
+  for (let index = start + 1; index < xml.length; index += 1) {
+    const char = xml[index]
+    if (quote) {
+      if (char === quote) {
+        quote = undefined
+      }
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      continue
+    }
+    if (char === '>') {
+      return index
+    }
+  }
+  return -1
+}
+
+function parseTag(raw: string): { name: string; attributes: Record<string, string> } | undefined {
+  const nameMatch = raw.match(/^([^\s/>]+)/u)
+  const name = nameMatch?.[1]
+  if (!name) {
+    return undefined
+  }
+
+  const attributes: Record<string, string> = {}
+  const attrPattern = /([^\s=/>]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/gu
+  for (const match of raw.slice(name.length).matchAll(attrPattern)) {
+    const attrName = match[1]
+    if (!attrName) {
+      continue
+    }
+    const attrValue = match[2] ?? match[3] ?? ''
+    attributes[attrName] = attrValue
+  }
+
+  return { name, attributes }
+}
+
+function toIsoDate(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined
+  }
+
+  const parsed = Date.parse(value)
+  return Number.isNaN(parsed) ? value : new Date(parsed).toISOString()
+}
+
+function decodeFileContent(raw: Buffer): EncodedFileContent {
+  if (looksLikeUtf8Text(raw)) {
+    return {
+      value: raw.toString('utf8'),
+      encoding: 'utf8',
+    }
+  }
+
+  return {
+    value: raw.toString('base64'),
+    encoding: 'base64',
+  }
+}
+
+function looksLikeUtf8Text(raw: Buffer): boolean {
+  if (raw.length === 0) {
+    return true
+  }
+
+  const decoded = raw.toString('utf8')
+  return !decoded.includes('\uFFFD') && !raw.includes(0)
+}
+
+function serializeFeedEntryStateMap(map: Map<string, FeedEntryState>): string {
+  return JSON.stringify([...map.entries()].sort(([left], [right]) => left.localeCompare(right)))
+}
+
+function decodeFeedEntryStateMap(value: string | undefined): Map<string, FeedEntryState> {
+  if (!value) {
+    return new Map()
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed)) {
+      return new Map()
+    }
+
+    return new Map(parsed.flatMap((entry) => {
+      if (!Array.isArray(entry) || typeof entry[0] !== 'string') {
+        return []
+      }
+
+      const key = entry[0]
+      const state = entry[1]
+      if (typeof state === 'string') {
+        return [[key, { version: state, fingerprint: state } satisfies FeedEntryState]]
+      }
+
+      if (
+        state
+        && typeof state === 'object'
+        && typeof (state as { version?: unknown }).version === 'string'
+        && typeof (state as { fingerprint?: unknown }).fingerprint === 'string'
+      ) {
+        return [[key, { version: (state as { version: string }).version, fingerprint: (state as { fingerprint: string }).fingerprint } satisfies FeedEntryState]]
+      }
+
+      return []
+    }))
+  } catch {
+    return new Map()
+  }
+}
+
+async function observeFileTarget(target: FileSystemFileObservationTarget): Promise<unknown> {
+  const raw = await fs.readFile(target.path)
+  const parsed = target.read === 'json'
+    ? JSON.parse(raw.toString('utf8'))
+    : target.read === 'bytes'
+      ? new Uint8Array(raw)
+      : decodeFileContent(raw).value
+
+  return target.project ? target.project(parsed) : parsed
+}
+
+async function observeDirectoryTarget(target: FileSystemDirectoryObservationTarget): Promise<unknown> {
+  const entries = await collectDirectoryEntries(target.path, {
+    recursive: target.recursive ?? false,
+    includeContent: target.includeContent ?? false,
+  })
+
+  const projected = await Promise.all(entries.map(async (entry) => {
+    const snapshot: FileSystemDirectoryEntrySnapshot = {
+      path: entry.path,
+      type: entry.type,
+      ...(entry.size !== undefined ? { size: entry.size } : {}),
+      ...(entry.content !== undefined ? { content: entry.content } : {}),
+      ...(entry.contentEncoding !== undefined ? { contentEncoding: entry.contentEncoding } : {}),
+    }
+    return target.projectEntry ? target.projectEntry(snapshot) : snapshot
+  }))
+
+  return projected
+}
+
+async function collectDirectoryEntries(
+  rootPath: string,
+  options: { recursive: boolean; includeContent: boolean },
+  currentPath = rootPath,
+): Promise<Array<{ path: string; type: 'file' | 'directory'; size?: number; content?: string; contentEncoding?: 'utf8' | 'base64' }>> {
+  const dirents = await fs.readdir(currentPath, { withFileTypes: true })
+  const collected: Array<{ path: string; type: 'file' | 'directory'; size?: number; content?: string; contentEncoding?: 'utf8' | 'base64' }> = []
+
+  for (const dirent of dirents.sort((left, right) => left.name.localeCompare(right.name))) {
+    const absolutePath = path.join(currentPath, dirent.name)
+    const relativePath = path.relative(rootPath, absolutePath) || dirent.name
+
+    if (dirent.isDirectory()) {
+      collected.push({
+        path: relativePath,
+        type: 'directory',
+      })
+      if (options.recursive) {
+        collected.push(...await collectDirectoryEntries(rootPath, options, absolutePath))
+      }
+      continue
+    }
+
+    if (dirent.isFile()) {
+      const stat = await fs.stat(absolutePath)
+      const content = options.includeContent ? decodeFileContent(await fs.readFile(absolutePath)) : undefined
+      collected.push({
+        path: relativePath,
+        type: 'file',
+        size: stat.size,
+        ...(content ? { content: content.value, contentEncoding: content.encoding } : {}),
+      })
+    }
+  }
+
+  return collected
 }
 
 export function mergeObservationCapabilities(

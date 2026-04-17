@@ -1,7 +1,7 @@
 # event-dispatch Specification
 
 ## Purpose
-TBD - created by archiving change add-source-observation. Update Purpose after archive.
+Define Starglass's delivery boundary. The system should dispatch normalized observation events to downstream commands or handlers without embedding provider-specific business logic or deciding what action should happen next.
 ## Requirements
 ### Requirement: Dispatch normalized observation events
 The system SHALL dispatch normalized observation events to a downstream target using a stable event envelope rather than a raw source payload.
