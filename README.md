@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./docs/assets/starglass-readme-banner.png" alt="Starglass banner showing sources flowing through the Starglass runtime to downstream agents and commands" />
+</p>
+
 # Starglass
 
 Starglass is an observation runtime for agent systems.
