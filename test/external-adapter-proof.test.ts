@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -9,13 +9,18 @@ const repoRoot = new URL('..', import.meta.url)
 test('external adapter example can be authored against the packaged public surface only', async () => {
   const sandbox = await mkdtemp(path.join(tmpdir(), 'starglass-pack-proof-'))
 
+  let tarballPath: string | undefined
+
   try {
+    const packageJson = JSON.parse(await readFile(new URL('./package.json', repoRoot), 'utf8')) as { version: string }
+    tarballPath = path.join(repoRoot.pathname, `starglass-${packageJson.version}.tgz`)
+
     const pkgJson = {
       name: 'starglass-external-proof',
       private: true,
       type: 'module',
       dependencies: {
-        starglass: `file:${path.join(repoRoot.pathname, 'starglass-0.1.0.tgz')}`,
+        starglass: `file:${tarballPath}`,
       },
     }
 
@@ -160,6 +165,15 @@ test('external adapter example can be authored against the packaged public surfa
 
     const { execFile } = await import('node:child_process')
     await new Promise<void>((resolve, reject) => {
+      execFile('npm', ['pack', '--silent'], { cwd: repoRoot.pathname }, (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(`npm pack failed\n${stdout}\n${stderr}`))
+          return
+        }
+        resolve()
+      })
+    })
+    await new Promise<void>((resolve, reject) => {
       execFile('npm', ['install'], { cwd: sandbox }, (error, stdout, stderr) => {
         if (error) {
           reject(new Error(`npm install failed\n${stdout}\n${stderr}`))
@@ -180,5 +194,8 @@ test('external adapter example can be authored against the packaged public surfa
     })
   } finally {
     await rm(sandbox, { recursive: true, force: true })
+    if (tarballPath) {
+      await rm(tarballPath, { force: true })
+    }
   }
 })

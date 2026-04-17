@@ -106,6 +106,23 @@ class SequencedSourceAdapter implements SourceAdapter<ExampleTarget> {
   }
 }
 
+async function waitFor(assertion: () => Promise<void>, timeoutMs = 250, intervalMs = 10): Promise<void> {
+  const startedAt = Date.now()
+  let lastError: unknown
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      await assertion()
+      return
+    } catch (error) {
+      lastError = error
+      await new Promise((resolve) => setTimeout(resolve, intervalMs))
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('condition not met before timeout')
+}
+
 class FailingThenPassingSourceAdapter implements SourceAdapter<ExampleTarget> {
   readonly source = 'example.build'
   calls = 0
@@ -1029,14 +1046,15 @@ test('watch loop slows down quiet targets within caller bounds and persists next
       },
     })
 
-    await new Promise((resolve) => setTimeout(resolve, 25))
-    await controller.stop()
+    await waitFor(async () => {
+      const stored = await new FileCheckpointStore(path.join(dir, 'checkpoints.json')).read('target-a')
+      assert.equal(stored?.observation?.cadence?.idleStreak, 3)
+      assert.equal(stored?.observation?.cadence?.currentDelayMs, 20)
+      assert.equal(stored?.observation?.cadence?.lastReason, 'idle')
+      assert.ok(stored?.observation?.cadence?.nextAttemptAt)
+    }, 400, 10)
 
-    const stored = await new FileCheckpointStore(path.join(dir, 'checkpoints.json')).read('target-a')
-    assert.equal(stored?.observation?.cadence?.idleStreak, 3)
-    assert.equal(stored?.observation?.cadence?.currentDelayMs, 20)
-    assert.equal(stored?.observation?.cadence?.lastReason, 'idle')
-    assert.ok(stored?.observation?.cadence?.nextAttemptAt)
+    await controller.stop()
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
