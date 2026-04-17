@@ -1,43 +1,72 @@
 # Starglass
 
-Starglass is a source-agnostic watcher chassis for agents and CLI tools.
+Starglass is an observation runtime for agent systems.
 
-It gives you the boring but essential machinery for watcher-style systems:
-- observation runtime
+It gives AI research and agent infrastructure teams a clean way to watch external state, turn meaningful change into normalized events, and resume safely across long-lived runs, cron jobs, and restarts.
+
+In practice, Starglass handles the hard, boring parts of observation-heavy systems:
+- poll-cycle execution
 - normalized event envelopes
-- checkpointing
+- compact checkpointing
 - duplicate suppression
 - dispatch to commands or in-process handlers
-- strategy-aware observation planning for generic transports like HTTP
+- explicit observation planning and adaptive cadence
+- generic source families for HTTP, feeds, and the filesystem
 
-You bring the source adapter, or use a generic transport primitive.
+You supply the source-specific meaning. Starglass supplies the runtime discipline.
 
-That can be Linear, RSS, a private API, a queue, a database row, a website, or some cursed internal thing only your team understands. Starglass should not care.
+That source can be a status API, an evaluation artifact, an RSS or Atom feed, a filesystem tree, a queue, a database row, a private internal endpoint, or some cursed research prototype that only made sense at 1:14am. Starglass should not care.
+
+## Why this exists
+
+Most agent systems eventually need the same substrate:
+- observe changing state outside the model
+- detect meaningful deltas rather than raw churn
+- survive restarts without replaying junk
+- preserve a compact resume point
+- hand off normalized events to downstream automation
+
+Teams often rebuild that machinery inside each connector, cron, or worker. The result is usually fragile, provider-specific, and impossible to reason about once the system grows.
+
+Starglass separates the observation problem from the business-logic problem.
+
+## What Starglass is for
+
+Starglass fits best when you are building:
+- agent or research pipelines that monitor external systems for meaningful change
+- evaluation or observability loops that need deterministic event identity
+- long-lived background watchers with restart-safe checkpointing
+- source-agnostic monitoring primitives for internal AI tooling
+- lightweight ingestion layers that should emit stable events, not raw payload archives
 
 ## Boundary
 
 Starglass owns:
 - watcher lifecycle
-- poll-cycle execution
+- poll execution and restart-safe resumption
 - normalized event contracts
 - compact checkpointing and dedupe
 - explicit observation planning and strategy selection
-- generic HTTP observation primitives
+- bounded adaptive cadence for long-lived watch loops
+- generic HTTP, feed, and filesystem observation primitives
 - dispatch primitives
 
 Starglass does not own:
-- a first-party source catalog
-- provider-specific business logic
+- a branded connector catalog
+- provider-specific business policy
 - workflow orchestration
 - deciding what an agent should do next
 - mutating external systems
+- pretending every source should look like a SaaS integration marketplace
 
 ## Mental model
 
 1. Define an observation target.
-2. Implement a `SourceAdapter` that can poll that target and emit normalized events, or use the built-in `HttpObservationAdapter`.
-3. Run the `ObservationRuntime`.
-4. Handle the resulting event envelope downstream.
+2. Implement a `SourceAdapter` for that target, or use a built-in adapter.
+3. Let `ObservationRuntime` resolve the observation plan, execute the poll, and persist compact state.
+4. Handle the normalized event envelope downstream in your agent, worker, or CLI.
+
+The key idea is simple: adapters decide what changed, Starglass decides how to observe and resume it safely.
 
 ## Minimal usage
 
@@ -92,6 +121,15 @@ await runtime.poll({
 
 The command target receives a normalized JSON envelope on stdin.
 
+## Built-in observation families
+
+Starglass includes built-in adapters for common source families:
+- `HttpObservationAdapter` for generic JSON and HTML resources
+- `FeedObservationAdapter` for RSS and Atom resources
+- `FileSystemObservationAdapter` for files and directories
+
+These all use the same runtime machinery: planning, compact checkpointing, normalized projection diffing, duplicate suppression, and dispatch.
+
 ## Strategy-aware observation
 
 Starglass can now resolve an explicit observation plan from declared capabilities.
@@ -110,7 +148,7 @@ For generic HTTP, Starglass starts honestly in projection-diff mode until it lea
 
 ## Generic HTTP observation
 
-Starglass includes a built-in `HttpObservationAdapter` for generic JSON and HTML resources.
+Starglass includes a built-in `HttpObservationAdapter` for generic JSON and HTML resources, aimed at the common case where you need reliable change detection without building a bespoke connector first.
 
 It supports:
 - conditional `ETag` and `Last-Modified` reuse once validators are learned
@@ -340,7 +378,7 @@ Key commands:
 
 ## Generic feed and filesystem observation
 
-Starglass also includes built-in generic source families for feeds and the filesystem, using the same planning, checkpoint, dedupe, and projection primitives as HTTP.
+Starglass also includes built-in source families for feeds and the filesystem, using the same planning, checkpointing, dedupe, and projection primitives as HTTP. The goal is not to ship a connector zoo. The goal is to prove the runtime generalizes cleanly across source families that show up constantly in agent and research workflows.
 
 - `FeedObservationAdapter` observes RSS and Atom resources through a small bounded XML tag parser, normalized entry projections, and compact per-entry state that tracks entry content revision separately from projected output.
 - `FileSystemObservationAdapter` observes files or directories through normalized projection diffs and stores compact fingerprints rather than raw archives.
@@ -349,8 +387,19 @@ Feed defaults are intentionally conservative: Starglass stores a compact entry-c
 
 Filesystem observation is projection-oriented, not archival. File targets still read `text`, `json`, or raw `bytes`. Directory targets with `includeContent: true` return UTF-8 text when content decodes cleanly, otherwise they expose base64 content with `contentEncoding: 'base64'` so binary files are represented honestly instead of being silently mangled.
 
-Both stay source-agnostic. They are meant to prove the observation chassis generalizes by family, not to start a branded connector catalog.
+Both stay source-agnostic. They are meant to be solid generic observation primitives, not thinly disguised product-marketing connectors.
 
 ## Status
 
-V1.1 wedge: runtime, file-backed checkpointing, duplicate suppression, command/handler dispatch, long-lived watch loops, lifecycle hooks, strategy selection, generic HTTP observation for JSON and HTML, generic RSS/Atom feed observation, generic filesystem observation, and bounded adaptive cadence are implemented.
+Current release: `v0.2.0`
+
+Implemented today:
+- observation runtime with restart-safe file-backed checkpointing
+- deterministic duplicate suppression and normalized event envelopes
+- command and in-process handler dispatch
+- long-lived watch loops with lifecycle hooks
+- explicit observation planning and bounded adaptive cadence
+- generic HTTP observation for JSON and HTML
+- generic RSS/Atom feed observation
+- generic filesystem observation
+- release verification and trusted publishing support
