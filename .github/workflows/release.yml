@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to release (defaults to main)
+        required: false
+        default: main
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify release surface
+        run: npm run release:check
+
+      - name: Determine package version
+        id: pkg
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure tag matches package version on tag pushes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "${{ steps.pkg.outputs.tag }}" ]; then
+            echo "Git tag ${GITHUB_REF_NAME} does not match package version ${{ steps.pkg.outputs.tag }}" >&2
+            exit 1
+          fi
+
+      - name: Publish to npm
+        run: npm publish --access public
+
+      - name: Create and push tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.pkg.outputs.tag }}"
+          git push origin "${{ steps.pkg.outputs.tag }}"
+
+      - name: Create GitHub release
+        run: |
+          gh release create "${{ steps.pkg.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --verify-tag \
+            --title "${{ steps.pkg.outputs.tag }}" \
+            --notes-file - <<'EOF'
+          ## Starglass ${{ steps.pkg.outputs.version }}
+
+          This release makes Starglass a proper source-agnostic watcher chassis.
+
+          Highlights:
+          - generic feed observation for RSS and Atom
+          - generic filesystem observation for files and directories
+          - explicit observation planning and adaptive cadence
+          - improved JSON and HTML projection authoring helpers
+          - hardened feed parsing and revision-aware feed event identity
+          - compact checkpointing, release discipline, and canonical OpenSpec coverage
+          EOF
