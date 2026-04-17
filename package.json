@@ -1,6 +1,6 @@
 {
   "name": "starglass",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Observation and dispatch layer for agent systems.",
   "type": "module",
   "main": "./dist/index.js",
@@ -52,4 +52,3 @@
     "typescript": "^5.8.3"
   }
 }
-
